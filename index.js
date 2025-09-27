@@ -1,108 +1,91 @@
 // index.js
-// Simpel backend til Adversus-integration på Render
+// === Simpel backend til Adversus-integration på Render ===
 
 const express = require('express');
 const morgan = require('morgan');
+const fetch = require('node-fetch');
 
-// ==== Miljø-variabler (Render) ====
+// === Miljø-variabler ===
 const PORT = process.env.PORT || 10000;
-const WEBHOOK_SECRET = process.env.ADVERSUS_WEBHOOK_SECRET || '';      // beskytter vores endpoints
+const WEBHOOK_SECRET = process.env.ADVERSUS_WEBHOOK_SECRET || '';
 const ADVERSUS_API_USER = process.env.ADVERSUS_API_USER || '';
 const ADVERSUS_API_PASS = process.env.ADVERSUS_API_PASS || '';
 const ADVERSUS_BASE_URL = process.env.ADVERSUS_BASE_URL || 'https://api.adversus.io';
 
-// ==== App & middleware ====
+// === App & middleware ===
 const app = express();
 app.use(morgan('tiny'));
-
-// Accepter JSON (Adversus webhook sender JSON)
-app.use(express.json({ type: ['application/json', 'text/*'] }));
+app.use(express.json({ type: ['application/json', 'text/plain'] }));
 app.use(express.urlencoded({ extended: false }));
 
-// ==== Hjælpere ====
-
-// Lidt lille in-memory buffer til debug (ikke til produktion)
+// === Hjælpere ===
 const lastEvents = [];
 const MAX_EVENTS = 200;
 
-// Basic-Auth header til Adversus REST
 function adversusAuthHeader() {
   const token = Buffer.from(`${ADVERSUS_API_USER}:${ADVERSUS_API_PASS}`).toString('base64');
   return `Basic ${token}`;
 }
 
-// Sikkerhed: fælles middleware til hemmelig nøgle (query eller header)
-function requireSecret(req, res, next) {
-  // Tillad både header og query parameter
+function requireSecret(req, res) {
   const headerSecret = req.headers['x-adversus-secret'];
-  const querySecret = req.query.secret || req.query.key;
-  const ok = WEBHOOK_SECRET && (headerSecret === WEBHOOK_SECRET || querySecret === WEBHOOK_SECRET);
+  const querySecret = req.query.secret;
+  const ok = (WEBHOOK_SECRET &&
+    (headerSecret === WEBHOOK_SECRET || querySecret === WEBHOOK_SECRET));
   if (!ok) {
-    return res.status(401).json({ ok: false, error: 'Unauthorized' });
+    res.status(401).json({ ok: false, error: 'Unauthorized' });
+    return false;
   }
-  next();
+  return true;
 }
 
-// ==== Basisruter ====
-
-// Health/velkomst
+// === Routes ===
 app.get('/', (req, res) => {
-  res.json({ message: '🚀 Velkommen til Gavdash API' });
+  res.json({ message: '🚀 Velkommen til Gavadsh API!' });
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
+// Debug: vis server health
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime() });
+});
 
-// ==== Webhook fra Adversus ====
-// Adversus kan kalde: POST /webhook/adversus?secret=<din-hemmelige-kode>
-// eller med header: x-adversus-secret: <din-hemmelige-kode>
-app.post('/webhook/adversus', requireSecret, (req, res) => {
-  const body = req.body || {};
+// Webhook endpoint fra Adversus
+app.post('/webhook/adversus', (req, res) => {
+  if (!requireSecret(req, res)) return;
 
-  // gem i debug-buffer (øverst)
-  lastEvents.unshift({
-    receivedAt: new Date().toISOString(),
-    body,
-  });
+  const payload = req.body || {};
+  lastEvents.unshift({ receivedAt: new Date().toISOString(), payload });
   if (lastEvents.length > MAX_EVENTS) lastEvents.pop();
 
-  console.log('Adversus webhook received:', JSON.stringify(body));
-  // svar hurtigt 200, så Adversus ikke retry’er
-  return res.status(200).json({ ok: true });
+  console.log('Adversus webhook received:', JSON.stringify(payload));
+  res.status(200).json({ ok: true });
 });
 
-// ==== Debug: se seneste events ====
-// GET /_debug/events?key=<din-secret>  (eller ?secret=...)
-app.get('/_debug/events', requireSecret, (req, res) => {
+// Debug: se seneste events
+app.get('/_debug/events', (req, res) => {
+  if (!requireSecret(req, res)) return;
   res.json(lastEvents);
 });
 
-// ==== Test Adversus-forbindelse ====
-// Henter liste over webhooks fra Adversus API for at bekræfte Basic Auth.
-// GET /adversus/test?key=<din-secret>
-app.get('/adversus/test', requireSecret, async (req, res) => {
+// Test Adversus API login
+app.get('/adversus/test', async (req, res) => {
   try {
+    if (!requireSecret(req, res)) return;
+
     const url = `${ADVERSUS_BASE_URL}/v1/webhooks`;
     const r = await fetch(url, {
       headers: {
         'Authorization': adversusAuthHeader(),
-        'Accept': 'application/json',
-      },
+        'Accept': 'application/json'
+      }
     });
 
     const body = await r.json().catch(() => ({}));
-    return res.status(r.ok ? 200 : r.status).json({
+    res.status(r.ok ? 200 : r.status).json({
       ok: r.ok,
       status: r.status,
       url,
-      body,
+      body
     });
   } catch (err) {
-    console.error('Adversus test error:', err);
-    return res.status(500).json({ ok: false, error: String(err.message || err) });
-  }
-});
-
-// ==== Start server ====
-app.listen(PORT, () => {
-  console.log(`Gavdash API listening on ${PORT}`);
-});
+    console.error('
