@@ -2,26 +2,26 @@
 // Simpel backend til Adversus-integration på Render
 
 const express = require('express');
-const morgan  = require('morgan');
+const morgan = require('morgan');
 
-// === Miljø-variabler ===
-const PORT               = process.env.PORT || 10000;
-const WEBHOOK_SECRET     = process.env.ADVERSUS_WEBHOOK_SECRET || '';  // beskytter vores endpoints
-const ADVERSUS_API_USER  = process.env.ADVERSUS_API_USER || '';
-const ADVERSUS_API_PASS  = process.env.ADVERSUS_API_PASS || '';
-const ADVERSUS_BASE_URL  = process.env.ADVERSUS_BASE_URL || 'https://api.adversus.io';
+// ==== Miljø-variabler (Render) ====
+const PORT = process.env.PORT || 10000;
+const WEBHOOK_SECRET = process.env.ADVERSUS_WEBHOOK_SECRET || '';      // beskytter vores endpoints
+const ADVERSUS_API_USER = process.env.ADVERSUS_API_USER || '';
+const ADVERSUS_API_PASS = process.env.ADVERSUS_API_PASS || '';
+const ADVERSUS_BASE_URL = process.env.ADVERSUS_BASE_URL || 'https://api.adversus.io';
 
-// === App & middleware ===
+// ==== App & middleware ====
 const app = express();
 app.use(morgan('tiny'));
 
-// Body-parsing (Adversus sender JSON)
-app.use(express.json({ type: ['application/json', 'text/plain'] }));
+// Accepter JSON (Adversus webhook sender JSON)
+app.use(express.json({ type: ['application/json', 'text/*'] }));
 app.use(express.urlencoded({ extended: false }));
 
-// === Hjælpere ===
+// ==== Hjælpere ====
 
-// Simple in-memory buffer til debug (ikke til produktion)
+// Lidt lille in-memory buffer til debug (ikke til produktion)
 const lastEvents = [];
 const MAX_EVENTS = 200;
 
@@ -31,75 +31,62 @@ function adversusAuthHeader() {
   return `Basic ${token}`;
 }
 
-// Sikkerhedstjek til endpoints beskyttet af vores hemmelige nøgle
-function requireSecret(req, res) {
+// Sikkerhed: fælles middleware til hemmelig nøgle (query eller header)
+function requireSecret(req, res, next) {
   // Tillad både header og query parameter
   const headerSecret = req.headers['x-adversus-secret'];
-  const querySecret  = req.query.secret || req.query.key;
-  const ok = (WEBHOOK_SECRET && (headerSecret === WEBHOOK_SECRET || querySecret === WEBHOOK_SECRET));
+  const querySecret = req.query.secret || req.query.key;
+  const ok = WEBHOOK_SECRET && (headerSecret === WEBHOOK_SECRET || querySecret === WEBHOOK_SECRET);
   if (!ok) {
-    res.status(401).json({ ok: false, error: 'Unauthorized' });
-    return false;
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
   }
-  return true;
+  next();
 }
 
-// === Basisruter ===
+// ==== Basisruter ====
 
+// Health/velkomst
 app.get('/', (req, res) => {
   res.json({ message: '🚀 Velkommen til Gavdash API' });
 });
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime() });
-});
+app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
 
-// === Webhook fra Adversus ===
-// Adversus kalder denne, når der sker et event (fx lead_saved)
-// Send "x-adversus-secret: <WEBHOOK_SECRET>" i headeren (eller ?secret=... i URL) for at autorisere.
-app.post('/webhook/adversus', (req, res) => {
-  if (!requireSecret(req, res)) return;
+// ==== Webhook fra Adversus ====
+// Adversus kan kalde: POST /webhook/adversus?secret=<din-hemmelige-kode>
+// eller med header: x-adversus-secret: <din-hemmelige-kode>
+app.post('/webhook/adversus', requireSecret, (req, res) => {
+  const body = req.body || {};
 
-  const payload = req.body || {};
-  // Gem en kort log af eventet til debug
+  // gem i debug-buffer (øverst)
   lastEvents.unshift({
     receivedAt: new Date().toISOString(),
-    headers: {
-      'user-agent': req.headers['user-agent'],
-      'content-type': req.headers['content-type'],
-    },
-    body: payload
+    body,
   });
   if (lastEvents.length > MAX_EVENTS) lastEvents.pop();
 
-  // Svar hurtigt 200 så Adversus ikke retryer
-  res.status(200).json({ ok: true });
+  console.log('Adversus webhook received:', JSON.stringify(body));
+  // svar hurtigt 200, så Adversus ikke retry’er
+  return res.status(200).json({ ok: true });
 });
 
-// === Debug: læs seneste events ===
-// GET /_debug/events?key=<WEBHOOK_SECRET>
-app.get('/_debug/events', (req, res) => {
-  const key = req.query.key;
-  if (!WEBHOOK_SECRET || key !== WEBHOOK_SECRET) {
-    return res.status(401).json({ ok: false, error: 'Unauthorized' });
-  }
+// ==== Debug: se seneste events ====
+// GET /_debug/events?key=<din-secret>  (eller ?secret=...)
+app.get('/_debug/events', requireSecret, (req, res) => {
   res.json(lastEvents);
 });
 
-// === Test Adversus-forbindelse ===
+// ==== Test Adversus-forbindelse ====
 // Henter liste over webhooks fra Adversus API for at bekræfte Basic Auth.
-app.get('/adversus/test', async (req, res) => {
+// GET /adversus/test?key=<din-secret>
+app.get('/adversus/test', requireSecret, async (req, res) => {
   try {
-    if (!WEBHOOK_SECRET || req.query.key !== WEBHOOK_SECRET) {
-      return res.status(401).json({ ok: false, error: 'Unauthorized' });
-    }
-
     const url = `${ADVERSUS_BASE_URL}/v1/webhooks`;
     const r = await fetch(url, {
       headers: {
         'Authorization': adversusAuthHeader(),
-        'Accept': 'application/json'
-      }
+        'Accept': 'application/json',
+      },
     });
 
     const body = await r.json().catch(() => ({}));
@@ -107,15 +94,15 @@ app.get('/adversus/test', async (req, res) => {
       ok: r.ok,
       status: r.status,
       url,
-      body
+      body,
     });
   } catch (err) {
     console.error('Adversus test error:', err);
-    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    return res.status(500).json({ ok: false, error: String(err.message || err) });
   }
 });
 
-// === Start server ===
+// ==== Start server ====
 app.listen(PORT, () => {
-  console.log(`Gavdash API listening on :${PORT}`);
+  console.log(`Gavdash API listening on ${PORT}`);
 });
