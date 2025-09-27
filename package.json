@@ -1,13 +1,13 @@
 {
-  "name": "gavdash-api",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
+  "name": "gavdash-backend",
+  "version": "1.0.0",
+  "main": "index.js",
+  "engines": { "node": ">=18" },
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "morgan": "^1.10.0"
   }
 }
