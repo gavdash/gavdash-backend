@@ -3,7 +3,7 @@
 
 import express from "express";
 import morgan from "morgan";
-import { Pool } from "pg"; // <-- NYT (Step 2.1)
+import { Pool } from "pg";
 
 // ==== Miljø-variabler ====
 const PORT = process.env.PORT || 10000;
@@ -13,8 +13,6 @@ const WEBHOOK_SECRET = process.env.ADVERSUS_WEBHOOK_SECRET || ""; // fx "testsec
 const ADVERSUS_API_USER = process.env.ADVERSUS_API_USER || "";
 const ADVERSUS_API_PASS = process.env.ADVERSUS_API_PASS || "";
 const ADVERSUS_BASE_URL = process.env.ADVERSUS_BASE_URL || "https://api.adversus.io";
-
-// Postgres (NYT)
 const DATABASE_URL = process.env.DATABASE_URL || "";
 
 // ==== App + middleware ====
@@ -24,8 +22,6 @@ app.use(express.json({ type: ["application/json", "text/plain"] }));
 app.use(express.urlencoded({ extended: false }));
 
 // ==== Hjælpere ====
-
-// Læs secrets fra header/query og diag
 function readSecrets(req) {
   const headerSecret = req.headers["x-adversus-secret"]?.toString() || "";
   const querySecret =
@@ -45,33 +41,17 @@ function readSecrets(req) {
 
   const ok = Boolean(usedSource);
 
-  return {
-    ok,
-    usedSource,
-    lengths: {
-      envSecret: envSecret.length,
-      headerSecret: headerSecret.length,
-      querySecret: querySecret.length,
-      queryKey: queryKey.length,
-    },
-  };
+  return { ok, usedSource };
 }
 
-// Genbrugelig middleware til secret-validering
 function requireSecret(req, res, next) {
   const info = readSecrets(req);
   if (!info.ok) {
-    return res.status(401).json({
-      ok: false,
-      error:
-        "Unauthorized: missing/invalid secret. Brug header 'x-adversus-secret' eller ?secret=...",
-    });
+    return res.status(401).json({ ok: false, error: "Unauthorized: invalid secret" });
   }
-  req._secretInfo = info;
   next();
 }
 
-// Basic Auth header til Adversus REST API
 function adversusAuthHeader() {
   const token = Buffer.from(`${ADVERSUS_API_USER}:${ADVERSUS_API_PASS}`).toString("base64");
   return `Basic ${token}`;
@@ -81,38 +61,38 @@ function adversusAuthHeader() {
 const lastEvents = [];
 const MAX_EVENTS = 200;
 
-// ==== Postgres pool (NYT) ====
+// ==== Postgres pool ====
 let pgPool = null;
 if (DATABASE_URL) {
-  pgPool = new Pool({
-    connectionString: DATABASE_URL,
-    max: 3,
-    idleTimeoutMillis: 30000,
-  });
+  pgPool = new Pool({ connectionString: DATABASE_URL, max: 3 });
   pgPool.on("error", (err) => console.error("PG pool error:", err));
-} else {
-  console.warn("DATABASE_URL is not set — DB disabled");
 }
+
+// ==== Init DB: opret tabel hvis ikke findes ====
+async function initDb() {
+  if (!pgPool) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS adversus_events (
+      id BIGSERIAL PRIMARY KEY,
+      received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      event_type TEXT,
+      payload JSONB NOT NULL
+    );
+  `);
+  console.log("DB ready: adversus_events table");
+}
+initDb().catch(err => console.error("DB init error:", err));
 
 // ==== Basisspor / health ====
 app.get("/health", (_req, res) => {
-  res.json({
-    status: "ok",
-    uptime: process.uptime(),
-    time: new Date().toISOString(),
-  });
+  res.json({ status: "ok", uptime: process.uptime(), time: new Date().toISOString() });
 });
 
-// ==== Diagnostic endpoint: vis hvordan secret blev matchet ====
+// ==== Debug endpoints ====
 app.get("/_show-secret", (req, res) => {
-  const info = readSecrets(req);
-  if (!info.ok) {
-    return res.status(401).json({ ok: false, error: "Unauthorized", ...info });
-  }
-  res.json({ ok: true, ...info });
+  res.json(readSecrets(req));
 });
 
-// ==== Debug: seneste events ====
 app.get("/_debug/events", requireSecret, (req, res) => {
   res.json(lastEvents.slice(0, 100));
 });
@@ -120,25 +100,37 @@ app.get("/debug/events", requireSecret, (req, res) => {
   res.json(lastEvents.slice(0, 100));
 });
 
-// ==== NYT: Debug DB status ====
 app.get("/_debug/db", requireSecret, async (_req, res) => {
-  if (!pgPool) return res.json({ ok: true, connected: false, note: "No DATABASE_URL set" });
+  if (!pgPool) return res.json({ ok: true, connected: false, note: "No DB" });
   try {
-    const r = await pgPool.query("select now() as now, version()");
-    res.json({ ok: true, connected: true, now: r.rows[0].now, version: r.rows[0].version });
+    const r = await pgPool.query("select now() as now, count(*) from adversus_events");
+    res.json({ ok: true, connected: true, now: r.rows[0].now, total_events: r.rows[0].count });
   } catch (e) {
-    res.status(500).json({ ok: false, connected: false, error: String(e?.message || e) });
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
 // ==== Webhook fra Adversus ====
-app.post("/webhook/adversus", requireSecret, (req, res) => {
+app.post("/webhook/adversus", requireSecret, async (req, res) => {
   const payload = req.body || {};
-  lastEvents.unshift({
-    receivedAt: new Date().toISOString(),
-    payload,
-  });
+  const eventType = payload?.event || payload?.type || null;
+
+  // Gem i memory (debug)
+  lastEvents.unshift({ receivedAt: new Date().toISOString(), eventType, payload });
   if (lastEvents.length > MAX_EVENTS) lastEvents.pop();
+
+  // Gem i DB
+  if (pgPool) {
+    try {
+      await pgPool.query(
+        "INSERT INTO adversus_events (event_type, payload) VALUES ($1, $2)",
+        [eventType, payload]
+      );
+    } catch (e) {
+      console.error("DB insert failed:", e);
+    }
+  }
+
   return res.status(200).json({ ok: true });
 });
 
@@ -147,27 +139,16 @@ app.get("/adversus/test", requireSecret, async (req, res) => {
   try {
     const url = `${ADVERSUS_BASE_URL}/v1/webhooks`;
     const r = await fetch(url, {
-      headers: {
-        Authorization: adversusAuthHeader(),
-        Accept: "application/json",
-      },
+      headers: { Authorization: adversusAuthHeader(), Accept: "application/json" },
     });
-
     let body;
     try {
       body = await r.json();
     } catch {
       body = await r.text();
     }
-
-    res.status(r.ok ? 200 : r.status).json({
-      ok: r.ok,
-      status: r.status,
-      url,
-      body: typeof body === "string" ? body.slice(0, 2000) : body,
-    });
+    res.status(r.ok ? 200 : r.status).json({ ok: r.ok, status: r.status, body });
   } catch (err) {
-    console.error("Adversus test error:", err);
     res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 });
