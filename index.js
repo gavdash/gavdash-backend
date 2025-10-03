@@ -7,9 +7,7 @@ import { Pool } from "pg";
 
 // ==== Miljø-variabler ====
 const PORT = process.env.PORT || 10000;
-
-// Sæt disse i Render -> Environment
-const WEBHOOK_SECRET = process.env.ADVERSUS_WEBHOOK_SECRET || ""; // fx "testsecret123"
+const WEBHOOK_SECRET = process.env.ADVERSUS_WEBHOOK_SECRET || ""; 
 const ADVERSUS_API_USER = process.env.ADVERSUS_API_USER || "";
 const ADVERSUS_API_PASS = process.env.ADVERSUS_API_PASS || "";
 const ADVERSUS_BASE_URL = process.env.ADVERSUS_BASE_URL || "https://api.adversus.io";
@@ -24,31 +22,22 @@ app.use(express.urlencoded({ extended: false }));
 // ==== Hjælpere ====
 function readSecrets(req) {
   const headerSecret = req.headers["x-adversus-secret"]?.toString() || "";
-  const querySecret =
-    req.query.secret?.toString() || req.query["adversus-secret"]?.toString() || "";
-  const queryKey =
-    req.query.key?.toString() || req.query["adversus-key"]?.toString() || "";
+  const querySecret = req.query.secret?.toString() || req.query["adversus-secret"]?.toString() || "";
+  const queryKey = req.query.key?.toString() || req.query["adversus-key"]?.toString() || "";
   const envSecret = WEBHOOK_SECRET || "";
 
   let usedSource = null;
-  if (headerSecret && envSecret && headerSecret === envSecret) {
-    usedSource = "header:secret";
-  } else if (querySecret && envSecret && querySecret === envSecret) {
-    usedSource = "query:secret";
-  } else if (queryKey && envSecret && queryKey === envSecret) {
-    usedSource = "query:key";
-  }
+  if (headerSecret && envSecret && headerSecret === envSecret) usedSource = "header:secret";
+  else if (querySecret && envSecret && querySecret === envSecret) usedSource = "query:secret";
+  else if (queryKey && envSecret && queryKey === envSecret) usedSource = "query:key";
 
   const ok = Boolean(usedSource);
-
   return { ok, usedSource };
 }
 
 function requireSecret(req, res, next) {
   const info = readSecrets(req);
-  if (!info.ok) {
-    return res.status(401).json({ ok: false, error: "Unauthorized: invalid secret" });
-  }
+  if (!info.ok) return res.status(401).json({ ok: false, error: "Unauthorized: invalid secret" });
   next();
 }
 
@@ -57,7 +46,7 @@ function adversusAuthHeader() {
   return `Basic ${token}`;
 }
 
-// ==== In-memory event buffer (kun til debug) ====
+// ==== In-memory buffer (debug) ====
 const lastEvents = [];
 const MAX_EVENTS = 200;
 
@@ -68,7 +57,7 @@ if (DATABASE_URL) {
   pgPool.on("error", (err) => console.error("PG pool error:", err));
 }
 
-// ==== Init DB: opret tabel hvis ikke findes ====
+// ==== Init DB ====
 async function initDb() {
   if (!pgPool) return;
   await pgPool.query(`
@@ -84,22 +73,16 @@ async function initDb() {
 initDb().catch(err => console.error("DB init error:", err));
 
 // ==== Basisspor / health ====
-app.get("/health", (_req, res) => {
-  res.json({ status: "ok", uptime: process.uptime(), time: new Date().toISOString() });
-});
+app.get("/health", (_req, res) => res.json({ status: "ok", uptime: process.uptime(), time: new Date().toISOString() }));
 
-// ==== Debug endpoints ====
-app.get("/_show-secret", (req, res) => {
-  res.json(readSecrets(req));
-});
+// ==== Debug: secret ====
+app.get("/_show-secret", (req, res) => res.json(readSecrets(req)));
 
-app.get("/_debug/events", requireSecret, (req, res) => {
-  res.json(lastEvents.slice(0, 100));
-});
-app.get("/debug/events", requireSecret, (req, res) => {
-  res.json(lastEvents.slice(0, 100));
-});
+// ==== Debug: memory events ====
+app.get("/_debug/events", requireSecret, (req, res) => res.json(lastEvents.slice(0, 100)));
+app.get("/debug/events", requireSecret, (req, res) => res.json(lastEvents.slice(0, 100)));
 
+// ==== Debug: DB status ====
 app.get("/_debug/db", requireSecret, async (_req, res) => {
   if (!pgPool) return res.json({ ok: true, connected: false, note: "No DB" });
   try {
@@ -110,12 +93,25 @@ app.get("/_debug/db", requireSecret, async (_req, res) => {
   }
 });
 
+// ==== NYT: Debug: DB events (seneste 50) ====
+app.get("/_debug/events/db", requireSecret, async (_req, res) => {
+  if (!pgPool) return res.json([]);
+  try {
+    const r = await pgPool.query(
+      "SELECT id, received_at, event_type FROM adversus_events ORDER BY received_at DESC LIMIT 50"
+    );
+    res.json(r.rows);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
 // ==== Webhook fra Adversus ====
 app.post("/webhook/adversus", requireSecret, async (req, res) => {
   const payload = req.body || {};
   const eventType = payload?.event || payload?.type || null;
 
-  // Gem i memory (debug)
+  // Gem i memory
   lastEvents.unshift({ receivedAt: new Date().toISOString(), eventType, payload });
   if (lastEvents.length > MAX_EVENTS) lastEvents.pop();
 
@@ -142,11 +138,7 @@ app.get("/adversus/test", requireSecret, async (req, res) => {
       headers: { Authorization: adversusAuthHeader(), Accept: "application/json" },
     });
     let body;
-    try {
-      body = await r.json();
-    } catch {
-      body = await r.text();
-    }
+    try { body = await r.json(); } catch { body = await r.text(); }
     res.status(r.ok ? 200 : r.status).json({ ok: r.ok, status: r.status, body });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err?.message || err) });
@@ -154,6 +146,4 @@ app.get("/adversus/test", requireSecret, async (req, res) => {
 });
 
 // ==== Start server ====
-app.listen(PORT, () => {
-  console.log(`Gavdash API listening on ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Gavdash API listening on ${PORT}`));
