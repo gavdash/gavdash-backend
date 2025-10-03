@@ -132,67 +132,80 @@ app.post("/webhook/adversus", requireSecret, async (req, res) => {
   return res.status(200).json({ ok: true });
 });
 
-// ==== Adversus REST helper (NYT) ====
-async function adversusGet(path) {
-  const url = `${ADVERSUS_BASE_URL}${path}`;
-  const r = await fetch(url, {
-    headers: {
-      Authorization: adversusAuthHeader(),
-      Accept: "application/json",
-    },
-  });
+// ==== Adversus REST helper ====
+async function adversusGet(pathWithQuery) {
+  const url = `${ADVERSUS_BASE_URL}${pathWithQuery}`;
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 15000); // 15s timeout
 
-  // Prøv JSON først, fald tilbage til text
+  const r = await fetch(url, {
+    headers: { Authorization: adversusAuthHeader(), Accept: "application/json" },
+    signal: controller.signal,
+  }).catch(err => {
+    throw new Error(`Fetch failed: ${err?.name || ""} ${err?.message || err}`);
+  });
+  clearTimeout(t);
+
   let body;
   try { body = await r.json(); } catch { body = await r.text(); }
 
   return { ok: r.ok, status: r.status, body, url };
 }
 
-// ==== NYT: Hent kampagner fra Adversus ====
+// ==== Kampagner ====
 app.get("/adversus/campaigns", requireSecret, async (_req, res) => {
   try {
     const r = await adversusGet("/v1/campaigns");
     if (!r.ok) {
       return res.status(r.status || 500).json({
-        ok: false,
-        status: r.status,
-        url: r.url,
+        ok: false, status: r.status, url: r.url,
         error: typeof r.body === "string" ? r.body.slice(0, 2000) : r.body,
       });
     }
-
     const raw = r.body;
-    let totalCount = undefined;
-    let data = raw;
-
-    if (Array.isArray(raw)) {
-      totalCount = raw.length;
-      data = raw.slice(0, 50); // begræns output i debug
-    }
-
-    res.json({
-      ok: true,
-      url: r.url,
-      total_count: totalCount,
-      returned: Array.isArray(data) ? data.length : undefined,
-      truncated: typeof totalCount === "number" ? totalCount > 50 : undefined,
-      data,
-    });
+    const totalCount = Array.isArray(raw) ? raw.length : undefined;
+    const data = Array.isArray(raw) ? raw.slice(0, 50) : raw;
+    res.json({ ok: true, url: r.url, total_count: totalCount, returned: Array.isArray(data) ? data.length : undefined, truncated: typeof totalCount === "number" ? totalCount > 50 : undefined, data });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-// ==== (findes i forvejen) Test Adversus REST API-call ====
+// ==== NYT: Leads (passthrough af query) ====
+app.get("/adversus/leads", requireSecret, async (req, res) => {
+  try {
+    // Behold alle query-parametre (fx ?limit=50&campaignId=123&from=2025-10-01&to=2025-10-03)
+    const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
+    const r = await adversusGet(`/v1/leads${search}`);
+    if (!r.ok) {
+      return res.status(r.status || 500).json({
+        ok: false, status: r.status, url: r.url,
+        error: typeof r.body === "string" ? r.body.slice(0, 2000) : r.body,
+      });
+    }
+
+    // Hvis svar er en kæmpe liste, så begræns debug-output for ikke at overvælde browseren
+    let data = r.body;
+    let totalCount, returned, truncated;
+    if (Array.isArray(data)) {
+      totalCount = data.length;
+      returned = Math.min(totalCount, 50);
+      truncated = totalCount > 50;
+      data = data.slice(0, 50);
+    }
+
+    res.json({ ok: true, url: r.url, total_count: totalCount, returned, truncated, data });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// ==== (findes i forvejen) Test Webhooks endpoint-list ====
 app.get("/adversus/test", requireSecret, async (_req, res) => {
   try {
     const url = `${ADVERSUS_BASE_URL}/v1/webhooks`;
-    const r = await fetch(url, {
-      headers: { Authorization: adversusAuthHeader(), Accept: "application/json" },
-    });
-    let body;
-    try { body = await r.json(); } catch { body = await r.text(); }
+    const r = await fetch(url, { headers: { Authorization: adversusAuthHeader(), Accept: "application/json" } });
+    let body; try { body = await r.json(); } catch { body = await r.text(); }
     res.status(r.ok ? 200 : r.status).json({ ok: r.ok, status: r.status, body, url });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err?.message || err) });
