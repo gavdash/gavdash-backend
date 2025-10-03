@@ -3,6 +3,7 @@
 
 import express from "express";
 import morgan from "morgan";
+import { Pool } from "pg"; // <-- NYT (Step 2.1)
 
 // ==== Miljø-variabler ====
 const PORT = process.env.PORT || 10000;
@@ -13,11 +14,12 @@ const ADVERSUS_API_USER = process.env.ADVERSUS_API_USER || "";
 const ADVERSUS_API_PASS = process.env.ADVERSUS_API_PASS || "";
 const ADVERSUS_BASE_URL = process.env.ADVERSUS_BASE_URL || "https://api.adversus.io";
 
+// Postgres (NYT)
+const DATABASE_URL = process.env.DATABASE_URL || "";
+
 // ==== App + middleware ====
 const app = express();
 app.use(morgan("dev"));
-
-// nogle gateways sender "text/plain"
 app.use(express.json({ type: ["application/json", "text/plain"] }));
 app.use(express.urlencoded({ extended: false }));
 
@@ -55,7 +57,7 @@ function readSecrets(req) {
   };
 }
 
-// Genbrugelig middleware til secret-validering (STEP 1)
+// Genbrugelig middleware til secret-validering
 function requireSecret(req, res, next) {
   const info = readSecrets(req);
   if (!info.ok) {
@@ -65,7 +67,7 @@ function requireSecret(req, res, next) {
         "Unauthorized: missing/invalid secret. Brug header 'x-adversus-secret' eller ?secret=...",
     });
   }
-  req._secretInfo = info; // nyttigt til debug
+  req._secretInfo = info;
   next();
 }
 
@@ -78,6 +80,19 @@ function adversusAuthHeader() {
 // ==== In-memory event buffer (kun til debug) ====
 const lastEvents = [];
 const MAX_EVENTS = 200;
+
+// ==== Postgres pool (NYT) ====
+let pgPool = null;
+if (DATABASE_URL) {
+  pgPool = new Pool({
+    connectionString: DATABASE_URL,
+    max: 3,
+    idleTimeoutMillis: 30000,
+  });
+  pgPool.on("error", (err) => console.error("PG pool error:", err));
+} else {
+  console.warn("DATABASE_URL is not set — DB disabled");
+}
 
 // ==== Basisspor / health ====
 app.get("/health", (_req, res) => {
@@ -97,28 +112,33 @@ app.get("/_show-secret", (req, res) => {
   res.json({ ok: true, ...info });
 });
 
-// ==== Debug: seneste events (STEP 1) ====
-// Original path
+// ==== Debug: seneste events ====
 app.get("/_debug/events", requireSecret, (req, res) => {
   res.json(lastEvents.slice(0, 100));
 });
-// Alias uden underscore
 app.get("/debug/events", requireSecret, (req, res) => {
   res.json(lastEvents.slice(0, 100));
+});
+
+// ==== NYT: Debug DB status ====
+app.get("/_debug/db", requireSecret, async (_req, res) => {
+  if (!pgPool) return res.json({ ok: true, connected: false, note: "No DATABASE_URL set" });
+  try {
+    const r = await pgPool.query("select now() as now, version()");
+    res.json({ ok: true, connected: true, now: r.rows[0].now, version: r.rows[0].version });
+  } catch (e) {
+    res.status(500).json({ ok: false, connected: false, error: String(e?.message || e) });
+  }
 });
 
 // ==== Webhook fra Adversus ====
 app.post("/webhook/adversus", requireSecret, (req, res) => {
   const payload = req.body || {};
-
-  // log i hukommelsesbufferen
   lastEvents.unshift({
     receivedAt: new Date().toISOString(),
     payload,
   });
   if (lastEvents.length > MAX_EVENTS) lastEvents.pop();
-
-  // returnér hurtigt 200 (Adversus forventer svar uden lang behandling)
   return res.status(200).json({ ok: true });
 });
 
@@ -133,7 +153,6 @@ app.get("/adversus/test", requireSecret, async (req, res) => {
       },
     });
 
-    // hvis parsing fejler, så få bare text
     let body;
     try {
       body = await r.json();
@@ -145,7 +164,6 @@ app.get("/adversus/test", requireSecret, async (req, res) => {
       ok: r.ok,
       status: r.status,
       url,
-      // begræns responsen lidt hvis den er stor
       body: typeof body === "string" ? body.slice(0, 2000) : body,
     });
   } catch (err) {
