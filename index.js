@@ -136,7 +136,7 @@ app.post("/webhook/adversus", requireSecret, async (req, res) => {
 async function adversusGet(pathWithQuery) {
   const url = `${ADVERSUS_BASE_URL}${pathWithQuery}`;
   const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), 15000); // 15s timeout
+  const t = setTimeout(() => controller.abort(), 15000);
 
   const r = await fetch(url, {
     headers: { Authorization: adversusAuthHeader(), Accept: "application/json" },
@@ -171,10 +171,9 @@ app.get("/adversus/campaigns", requireSecret, async (_req, res) => {
   }
 });
 
-// ==== NYT: Leads (passthrough af query) ====
+// ==== Leads (passthrough af query) ====
 app.get("/adversus/leads", requireSecret, async (req, res) => {
   try {
-    // Behold alle query-parametre (fx ?limit=50&campaignId=123&from=2025-10-01&to=2025-10-03)
     const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
     const r = await adversusGet(`/v1/leads${search}`);
     if (!r.ok) {
@@ -184,7 +183,6 @@ app.get("/adversus/leads", requireSecret, async (req, res) => {
       });
     }
 
-    // Hvis svar er en kæmpe liste, så begræns debug-output for ikke at overvælde browseren
     let data = r.body;
     let totalCount, returned, truncated;
     if (Array.isArray(data)) {
@@ -200,15 +198,40 @@ app.get("/adversus/leads", requireSecret, async (req, res) => {
   }
 });
 
-// ==== (findes i forvejen) Test Webhooks endpoint-list ====
-app.get("/adversus/test", requireSecret, async (_req, res) => {
+// ==== NYT: Dashboard summary ====
+app.get("/dashboard/summary", requireSecret, async (_req, res) => {
+  if (!pgPool) return res.status(200).json({ ok: true, db: false, note: "No DB" });
   try {
-    const url = `${ADVERSUS_BASE_URL}/v1/webhooks`;
-    const r = await fetch(url, { headers: { Authorization: adversusAuthHeader(), Accept: "application/json" } });
-    let body; try { body = await r.json(); } catch { body = await r.text(); }
-    res.status(r.ok ? 200 : r.status).json({ ok: r.ok, status: r.status, body, url });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: String(err?.message || err) });
+    const [total, last24h, byType, recent] = await Promise.all([
+      pgPool.query("SELECT COUNT(*)::bigint AS c FROM adversus_events"),
+      pgPool.query("SELECT COUNT(*)::bigint AS c FROM adversus_events WHERE received_at >= now() - interval '24 hours'"),
+      pgPool.query(`
+        SELECT COALESCE(event_type,'(null)') AS event_type, COUNT(*)::bigint AS c
+        FROM adversus_events
+        WHERE received_at >= now() - interval '24 hours'
+        GROUP BY 1
+        ORDER BY c DESC, event_type ASC
+      `),
+      pgPool.query(`
+        SELECT id, received_at, event_type
+        FROM adversus_events
+        ORDER BY received_at DESC
+        LIMIT 20
+      `),
+    ]);
+
+    res.json({
+      ok: true,
+      db: true,
+      totals: {
+        events_all_time: Number(total.rows[0].c),
+        events_last_24h: Number(last24h.rows[0].c),
+      },
+      by_type_last_24h: byType.rows.map(r => ({ event_type: r.event_type, count: Number(r.c) })),
+      recent_events: recent.rows, // [{id, received_at, event_type}]
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
