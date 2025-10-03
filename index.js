@@ -1,4 +1,4 @@
-// ==== Gavdash Backend (Adversus webhook + test) ====
+// ==== Gavdash Backend (Adversus webhook + DB + API) ====
 // Node 18+ (Render), Express 4
 
 import express from "express";
@@ -7,7 +7,7 @@ import { Pool } from "pg";
 
 // ==== Miljø-variabler ====
 const PORT = process.env.PORT || 10000;
-const WEBHOOK_SECRET = process.env.ADVERSUS_WEBHOOK_SECRET || ""; 
+const WEBHOOK_SECRET = process.env.ADVERSUS_WEBHOOK_SECRET || ""; // fx "testsecret123"
 const ADVERSUS_API_USER = process.env.ADVERSUS_API_USER || "";
 const ADVERSUS_API_PASS = process.env.ADVERSUS_API_PASS || "";
 const ADVERSUS_BASE_URL = process.env.ADVERSUS_BASE_URL || "https://api.adversus.io";
@@ -73,7 +73,9 @@ async function initDb() {
 initDb().catch(err => console.error("DB init error:", err));
 
 // ==== Basisspor / health ====
-app.get("/health", (_req, res) => res.json({ status: "ok", uptime: process.uptime(), time: new Date().toISOString() }));
+app.get("/health", (_req, res) =>
+  res.json({ status: "ok", uptime: process.uptime(), time: new Date().toISOString() })
+);
 
 // ==== Debug: secret ====
 app.get("/_show-secret", (req, res) => res.json(readSecrets(req)));
@@ -93,7 +95,7 @@ app.get("/_debug/db", requireSecret, async (_req, res) => {
   }
 });
 
-// ==== NYT: Debug: DB events (seneste 50) ====
+// ==== Debug: DB events (seneste 50) ====
 app.get("/_debug/events/db", requireSecret, async (_req, res) => {
   if (!pgPool) return res.json([]);
   try {
@@ -130,8 +132,60 @@ app.post("/webhook/adversus", requireSecret, async (req, res) => {
   return res.status(200).json({ ok: true });
 });
 
-// ==== Test Adversus REST API-call ====
-app.get("/adversus/test", requireSecret, async (req, res) => {
+// ==== Adversus REST helper (NYT) ====
+async function adversusGet(path) {
+  const url = `${ADVERSUS_BASE_URL}${path}`;
+  const r = await fetch(url, {
+    headers: {
+      Authorization: adversusAuthHeader(),
+      Accept: "application/json",
+    },
+  });
+
+  // Prøv JSON først, fald tilbage til text
+  let body;
+  try { body = await r.json(); } catch { body = await r.text(); }
+
+  return { ok: r.ok, status: r.status, body, url };
+}
+
+// ==== NYT: Hent kampagner fra Adversus ====
+app.get("/adversus/campaigns", requireSecret, async (_req, res) => {
+  try {
+    const r = await adversusGet("/v1/campaigns");
+    if (!r.ok) {
+      return res.status(r.status || 500).json({
+        ok: false,
+        status: r.status,
+        url: r.url,
+        error: typeof r.body === "string" ? r.body.slice(0, 2000) : r.body,
+      });
+    }
+
+    const raw = r.body;
+    let totalCount = undefined;
+    let data = raw;
+
+    if (Array.isArray(raw)) {
+      totalCount = raw.length;
+      data = raw.slice(0, 50); // begræns output i debug
+    }
+
+    res.json({
+      ok: true,
+      url: r.url,
+      total_count: totalCount,
+      returned: Array.isArray(data) ? data.length : undefined,
+      truncated: typeof totalCount === "number" ? totalCount > 50 : undefined,
+      data,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// ==== (findes i forvejen) Test Adversus REST API-call ====
+app.get("/adversus/test", requireSecret, async (_req, res) => {
   try {
     const url = `${ADVERSUS_BASE_URL}/v1/webhooks`;
     const r = await fetch(url, {
@@ -139,7 +193,7 @@ app.get("/adversus/test", requireSecret, async (req, res) => {
     });
     let body;
     try { body = await r.json(); } catch { body = await r.text(); }
-    res.status(r.ok ? 200 : r.status).json({ ok: r.ok, status: r.status, body });
+    res.status(r.ok ? 200 : r.status).json({ ok: r.ok, status: r.status, body, url });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
