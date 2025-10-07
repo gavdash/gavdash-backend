@@ -16,7 +16,6 @@ const DATABASE_URL = process.env.DATABASE_URL || "";
 // ==== App + middleware ====
 const app = express();
 app.use(morgan("dev"));
-// nogle gateways sender "text/plain"
 app.use(express.json({ type: ["application/json", "text/plain"] }));
 app.use(express.urlencoded({ extended: false }));
 
@@ -37,27 +36,21 @@ function readSecrets(req) {
   const ok = Boolean(usedSource);
   return { ok, usedSource };
 }
-
 function requireSecret(req, res, next) {
   const info = readSecrets(req);
   if (!info.ok) {
     return res
       .status(401)
-      .json({
-        ok: false,
-        error:
-          "Unauthorized: missing/invalid secret. Brug header 'x-adversus-secret' eller ?secret=...",
-      });
+      .json({ ok: false, error: "Unauthorized: missing/invalid secret. Brug header 'x-adversus-secret' eller ?secret=..." });
   }
   next();
 }
-
 function adversusAuthHeader() {
   const token = Buffer.from(`${ADVERSUS_API_USER}:${ADVERSUS_API_PASS}`).toString("base64");
   return `Basic ${token}`;
 }
 
-// ==== In-memory buffer (debug) ====
+// ==== In-memory (debug) ====
 const lastEvents = [];
 const MAX_EVENTS = 200;
 
@@ -85,35 +78,20 @@ async function initDb() {
 }
 initDb().catch((err) => console.error("DB init error:", err));
 
-// ==== Basisspor / health ====
-app.get("/health", (_req, res) =>
-  res.json({ status: "ok", uptime: process.uptime(), time: new Date().toISOString() })
-);
-
-// ==== Debug: secret-match ====
+// ==== Health / Debug ====
+app.get("/health", (_req, res) => res.json({ status: "ok", uptime: process.uptime(), time: new Date().toISOString() }));
 app.get("/_show-secret", (req, res) => res.json(readSecrets(req)));
-
-// ==== Debug: memory events ====
 app.get("/_debug/events", requireSecret, (_req, res) => res.json(lastEvents.slice(0, 100)));
 app.get("/debug/events", requireSecret, (_req, res) => res.json(lastEvents.slice(0, 100)));
-
-// ==== Debug: DB status ====
 app.get("/_debug/db", requireSecret, async (_req, res) => {
   if (!pgPool) return res.json({ ok: true, connected: false, note: "No DB" });
   try {
     const r = await pgPool.query("select now() as now, count(*) from adversus_events");
-    res.json({
-      ok: true,
-      connected: true,
-      now: r.rows[0].now,
-      total_events: r.rows[0].count,
-    });
+    res.json({ ok: true, connected: true, now: r.rows[0].now, total_events: r.rows[0].count });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
-
-// ==== Debug: DB events (seneste 50) ====
 app.get("/_debug/events/db", requireSecret, async (_req, res) => {
   if (!pgPool) return res.json([]);
   try {
@@ -126,51 +104,35 @@ app.get("/_debug/events/db", requireSecret, async (_req, res) => {
   }
 });
 
-// ==== Webhook fra Adversus ====
+// ==== Webhook ====
 app.post("/webhook/adversus", requireSecret, async (req, res) => {
   const payload = req.body || {};
   const eventType = payload?.event || payload?.type || null;
 
-  // Gem i memory (debug)
   lastEvents.unshift({ receivedAt: new Date().toISOString(), eventType, payload });
   if (lastEvents.length > MAX_EVENTS) lastEvents.pop();
 
-  // Gem i DB
   if (pgPool) {
     try {
-      await pgPool.query("INSERT INTO adversus_events (event_type, payload) VALUES ($1, $2)", [
-        eventType,
-        payload,
-      ]);
+      await pgPool.query("INSERT INTO adversus_events (event_type, payload) VALUES ($1, $2)", [eventType, payload]);
     } catch (e) {
       console.error("DB insert failed:", e);
     }
   }
-
   return res.status(200).json({ ok: true });
 });
 
-// ==== Adversus REST helper ====
+// ==== REST helper ====
 async function adversusGet(pathWithQuery) {
   const url = `${ADVERSUS_BASE_URL}${pathWithQuery}`;
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), 15000);
-
   const r = await fetch(url, {
     headers: { Authorization: adversusAuthHeader(), Accept: "application/json" },
     signal: controller.signal,
-  }).catch((err) => {
-    throw new Error(`Fetch failed: ${err?.name || ""} ${err?.message || err}`);
-  });
+  }).catch((err) => { throw new Error(`Fetch failed: ${err?.name || ""} ${err?.message || err}`); });
   clearTimeout(t);
-
-  let body;
-  try {
-    body = await r.json();
-  } catch {
-    body = await r.text();
-  }
-
+  let body; try { body = await r.json(); } catch { body = await r.text(); }
   return { ok: r.ok, status: r.status, body, url };
 }
 
@@ -178,75 +140,41 @@ async function adversusGet(pathWithQuery) {
 app.get("/adversus/campaigns", requireSecret, async (_req, res) => {
   try {
     const r = await adversusGet("/v1/campaigns");
-    if (!r.ok) {
-      return res.status(r.status || 500).json({
-        ok: false,
-        status: r.status,
-        url: r.url,
-        error: typeof r.body === "string" ? r.body.slice(0, 2000) : r.body,
-      });
-    }
+    if (!r.ok) return res.status(r.status || 500).json({ ok: false, status: r.status, url: r.url, error: typeof r.body === "string" ? r.body.slice(0, 2000) : r.body });
     const raw = r.body;
     const totalCount = Array.isArray(raw) ? raw.length : undefined;
     const data = Array.isArray(raw) ? raw.slice(0, 50) : raw;
-
-    res.json({
-      ok: true,
-      url: r.url,
-      total_count: totalCount,
-      returned: Array.isArray(data) ? data.length : undefined,
-      truncated: typeof totalCount === "number" ? totalCount > 50 : undefined,
-      data,
-    });
+    res.json({ ok: true, url: r.url, total_count: totalCount, returned: Array.isArray(data) ? data.length : undefined, truncated: typeof totalCount === "number" ? totalCount > 50 : undefined, data });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-// ==== Leads (normaliseret til altid at være en liste i data) ====
+// ==== Leads (normaliseret til flad liste) ====
 app.get("/adversus/leads", requireSecret, async (req, res) => {
   try {
     const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
     const r = await adversusGet(`/v1/leads${search}`);
-    if (!r.ok) {
-      return res.status(r.status || 500).json({
-        ok: false,
-        status: r.status,
-        url: r.url,
-        error: typeof r.body === "string" ? r.body.slice(0, 2000) : r.body,
-      });
-    }
+    if (!r.ok) return res.status(r.status || 500).json({ ok: false, status: r.status, url: r.url, error: typeof r.body === "string" ? r.body.slice(0, 2000) : r.body });
 
-    // --- normalisér til en flad liste ---
     const payload = r.body;
     let items = [];
-    if (Array.isArray(payload)) {
-      items = payload;
-    } else if (payload && typeof payload === "object") {
-      // typiske feltnavne
+    if (Array.isArray(payload)) items = payload;
+    else if (payload && typeof payload === "object") {
       for (const k of ["items", "data", "rows", "results", "list", "leads"]) {
-        if (Array.isArray(payload[k])) {
-          items = payload[k];
-          break;
-        }
+        if (Array.isArray(payload[k])) { items = payload[k]; break; }
       }
-      // fallback: find første array-felt
       if (!items.length) {
         const firstArrayKey = Object.keys(payload).find((k) => Array.isArray(payload[k]));
         if (firstArrayKey) items = payload[firstArrayKey];
       }
     }
 
-    // respekter evt. ?limit= (også hvis API’et sender mere)
     const limitQ = parseInt(String(req.query.limit ?? ""), 10);
     const limit = Number.isFinite(limitQ) && limitQ > 0 ? limitQ : null;
     let truncated = false;
-    if (limit && items.length > limit) {
-      items = items.slice(0, limit);
-      truncated = true;
-    }
+    if (limit && items.length > limit) { items = items.slice(0, limit); truncated = true; }
 
-    // prøv at finde total i payload; ellers brug længden
     const totalCount =
       (typeof payload?.total === "number" && payload.total) ||
       (typeof payload?.count === "number" && payload.count) ||
@@ -254,47 +182,83 @@ app.get("/adversus/leads", requireSecret, async (req, res) => {
       (Array.isArray(r.body) ? r.body.length : undefined) ||
       items.length;
 
-    res.json({
-      ok: true,
-      url: r.url,
-      total_count: totalCount,
-      returned: items.length,
-      truncated,
-      data: items,
-    });
+    res.json({ ok: true, url: r.url, total_count: totalCount, returned: items.length, truncated, data: items });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-// ==== Test: vis registrerede webhooks i Adversus ====
-app.get("/adversus/test", requireSecret, async (_req, res) => {
-  try {
-    const url = `${ADVERSUS_BASE_URL}/v1/webhooks`;
-    const r = await fetch(url, {
-      headers: { Authorization: adversusAuthHeader(), Accept: "application/json" },
-    });
-    let body;
-    try {
-      body = await r.json();
-    } catch {
-      body = await r.text();
+// ==== NYT: Leads Inspect (find felter + samples) ====
+function flatten(obj, maxDepth = 2, prefix = "", out = {}) {
+  if (!obj || typeof obj !== "object" || maxDepth < 0) return out;
+  if (Array.isArray(obj)) {
+    // hvis array af simple værdier, gem som join; hvis array af objekter, skip dybere
+    const simple = obj.every(v => v == null || ["string","number","boolean"].includes(typeof v));
+    if (simple) { out[prefix || "[]"] = obj.join(", "); return out; }
+    return out; // undgå at eksplodere på dybe arrays af objekter
+  }
+  for (const [k,v] of Object.entries(obj)) {
+    const key = prefix ? `${prefix}.${k}` : k;
+    if (v != null && typeof v === "object" && !Array.isArray(v) && maxDepth > 0) {
+      flatten(v, maxDepth - 1, key, out);
+    } else if (Array.isArray(v)) {
+      // tag første værdi som sample hvis simpel
+      const simple = v.every(x => x == null || ["string","number","boolean"].includes(typeof x));
+      out[key] = simple ? v.join(", ") : `[array(${v.length})]`;
+    } else {
+      out[key] = v;
     }
-    res.status(r.ok ? 200 : r.status).json({ ok: r.ok, status: r.status, body, url });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+  return out;
+}
+
+app.get("/adversus/leads/inspect", requireSecret, async (req, res) => {
+  try {
+    // genbrug normaliseringslogikken
+    const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
+    const r = await adversusGet(`/v1/leads${search}`);
+    if (!r.ok) return res.status(r.status || 500).json({ ok: false, status: r.status, url: r.url, error: typeof r.body === "string" ? r.body.slice(0, 2000) : r.body });
+
+    let items = [];
+    const payload = r.body;
+    if (Array.isArray(payload)) items = payload;
+    else if (payload && typeof payload === "object") {
+      for (const k of ["items", "data", "rows", "results", "list", "leads"]) {
+        if (Array.isArray(payload[k])) { items = payload[k]; break; }
+      }
+      if (!items.length) {
+        const firstArrayKey = Object.keys(payload).find((k) => Array.isArray(payload[k]));
+        if (firstArrayKey) items = payload[firstArrayKey];
+      }
+    }
+
+    // inspicér de første N rows
+    const inspectN = Math.min(items.length, Math.max(1, Math.min(200, parseInt(String(req.query.limit ?? "50"),10))));
+    const counts = {};
+    const samples = {};
+    for (let i = 0; i < inspectN; i++) {
+      const flat = flatten(items[i], 2);
+      for (const [k, v] of Object.entries(flat)) {
+        counts[k] = (counts[k] || 0) + 1;
+        if (!(k in samples)) samples[k] = v;
+      }
+    }
+    const keys = Object.keys(counts).sort((a,b)=> a.localeCompare(b));
+    const stats = keys.map(k => ({ key: k, count: counts[k], pct: counts[k]/inspectN, sample: samples[k] }));
+
+    res.json({ ok: true, url: r.url, inspected: inspectN, stats, sample: items.slice(0, Math.min(2, inspectN)) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-// ==== Dashboard summary (til UI) ====
+// ==== Dashboard summary ====
 app.get("/dashboard/summary", requireSecret, async (_req, res) => {
   if (!pgPool) return res.status(200).json({ ok: true, db: false, note: "No DB" });
   try {
     const [total, last24h, byType, recent] = await Promise.all([
       pgPool.query("SELECT COUNT(*)::bigint AS c FROM adversus_events"),
-      pgPool.query(
-        "SELECT COUNT(*)::bigint AS c FROM adversus_events WHERE received_at >= now() - interval '24 hours'"
-      ),
+      pgPool.query("SELECT COUNT(*)::bigint AS c FROM adversus_events WHERE received_at >= now() - interval '24 hours'"),
       pgPool.query(`
         SELECT COALESCE(event_type,'(null)') AS event_type, COUNT(*)::bigint AS c
         FROM adversus_events
@@ -309,14 +273,10 @@ app.get("/dashboard/summary", requireSecret, async (_req, res) => {
         LIMIT 20
       `),
     ]);
-
     res.json({
       ok: true,
       db: true,
-      totals: {
-        events_all_time: Number(total.rows[0].c),
-        events_last_24h: Number(last24h.rows[0].c),
-      },
+      totals: { events_all_time: Number(total.rows[0].c), events_last_24h: Number(last24h.rows[0].c) },
       by_type_last_24h: byType.rows.map((r) => ({ event_type: r.event_type, count: Number(r.c) })),
       recent_events: recent.rows,
     });
