@@ -485,7 +485,7 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
   }
 });
 
-// ==== NY: scan efter NUMERISKE nøgler i resultData (fx 96830) ====
+// ==== NY: scan efter NUMERISKE nøgler i resultData (fx 96830) – objekt-venlig ====
 app.get("/adversus/leads/resultdata_ids_preview", requireSecret, async (req, res) => {
   try {
     const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
@@ -497,7 +497,7 @@ app.get("/adversus/leads/resultdata_ids_preview", requireSecret, async (req, res
       });
     }
 
-    // normaliser
+    // normaliser lead-liste
     const payload = listResp.body;
     let leads = [];
     if (Array.isArray(payload)) leads = payload;
@@ -514,19 +514,46 @@ app.get("/adversus/leads/resultdata_ids_preview", requireSecret, async (req, res
     const sample = Math.max(1, Math.min(15, parseInt(String(req.query.sample || "10"),10) || 10));
     const toScan = leads.slice(0, sample);
 
-    function collectNumericKeys(obj) {
+    // Hjælper: træk (id,label,example) ud af værdi-objekter
+    function coerceExample(val) {
+      if (val == null) return null;
+      if (Array.isArray(val)) return val.filter(x => x != null).map(String).join(", ");
+      if (typeof val === "object") {
+        const v =
+          val.value ?? val.val ?? val.text ??
+          (Array.isArray(val.values) ? val.values.join(", ") : undefined);
+        return v != null ? String(v) : JSON.stringify(val).slice(0, 200);
+      }
+      return String(val);
+    }
+    function extractLabel(val, fallbackKey) {
+      if (val && typeof val === "object") {
+        const lbl = val.label ?? val.name ?? val.title ?? null;
+        if (lbl) return String(lbl);
+      }
+      // hvis ikke vi kan finde label, brug nøgle som fallback
+      return fallbackKey != null ? String(fallbackKey) : null;
+    }
+
+    // Saml numeriske keys i et objekt (direkte eller i seneste resultater)
+    function collectNumericEntries(obj) {
       const out = [];
       if (!obj || typeof obj !== "object") return out;
-      for (const [k,v] of Object.entries(obj)) {
-        if (/^\d+$/.test(k)) {
-          const id = Number(k);
-          if (v != null && String(v).trim?.() !== "") out.push({ id, example: v });
+      for (const [k, v] of Object.entries(obj)) {
+        if (!/^\d+$/.test(k)) continue;
+        const numId = Number(k);
+
+        const example = coerceExample(v);
+        const label = extractLabel(v, k);
+
+        if (example != null && String(example).trim() !== "") {
+          out.push({ id: numId, label, example });
         }
       }
       return out;
     }
 
-    const seen = new Map(); // id -> {count, example}
+    const seen = new Map(); // id -> { count, labelSamples:Set, example }
     const perLead = [];
     const delay = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -535,18 +562,20 @@ app.get("/adversus/leads/resultdata_ids_preview", requireSecret, async (req, res
       if (!id) continue;
       const hits = [];
 
-      // A) resultData direkte på lead (expand/include=results for at få “resultData” som nogle konti har på leadet)
-      const pA = await adversusGet(`/v1/leads/${id}?expand=results`).catch(() => null);
-      if (pA?.ok && pA.body) {
-        const b = pA.body;
-        const candidates = [
+      // A) expand=results for at få både lead-level resultData og results[]
+      const p = await adversusGet(`/v1/leads/${id}?expand=results`).catch(() => null);
+      if (p?.ok && p.body) {
+        const b = p.body;
+
+        // Mulige placeringer af resultData direkte på lead
+        const leadLevelCandidates = [
           b?.resultData, b?.data?.resultData,
           Array.isArray(b?.leads) ? b.leads[0]?.resultData : undefined,
           Array.isArray(b?.leads) ? b.leads[0]?.data?.resultData : undefined
         ];
-        for (const c of candidates) hits.push(...collectNumericKeys(c));
+        for (const c of leadLevelCandidates) hits.push(...collectNumericEntries(c));
 
-        // B) seneste resultater
+        // Seneste result
         let results = Array.isArray(b?.results) ? b.results : null;
         if (!results && Array.isArray(b?.leads)) {
           const first = b.leads[0];
@@ -555,156 +584,34 @@ app.get("/adversus/leads/resultdata_ids_preview", requireSecret, async (req, res
         if (Array.isArray(results) && results.length) {
           results.sort((a,x) => new Date(x?.created||x?.updated||0) - new Date(a?.created||a?.updated||0));
           const latest = results[0];
-          hits.push(...collectNumericKeys(latest?.resultData), ...collectNumericKeys(latest?.data?.resultData));
+          hits.push(...collectNumericEntries(latest?.resultData), ...collectNumericEntries(latest?.data?.resultData));
         }
       }
 
       perLead.push({ leadId: id, ids: hits });
 
+      // Aggreger pr. id
       for (const h of hits) {
-        if (!seen.has(h.id)) seen.set(h.id, { count: 0, example: h.example });
+        if (!seen.has(h.id)) seen.set(h.id, { count: 0, labelSamples: new Set(), example: h.example });
         const a = seen.get(h.id);
         a.count++;
+        if (h.label) a.labelSamples.add(h.label);
         if (!a.example) a.example = h.example;
       }
-      await delay(400);
+
+      await delay(350);
     }
 
-    const ids = Array.from(seen.entries()).map(([id,a]) => ({ id, count: a.count, example: a.example }))
-      .sort((x,y) => y.count - x.count || (x.id - y.id));
+    const ids = Array.from(seen.entries()).map(([id, a]) => ({
+      id,
+      labels: Array.from(a.labelSamples).slice(0, 3),
+      count: a.count,
+      example: a.example
+    })).sort((x,y) => y.count - x.count || (x.id - y.id));
 
     res.json({ ok:true, scanned: toScan.length, ids, sample: perLead.slice(0,3) });
   } catch (e) {
     res.status(500).json({ ok:false, error: String(e.message || e) });
-  }
-});
-
-// ---- PREVIEW: resultFields pr. lead (label + id + eksempel) ----
-app.get("/adversus/leads/resultfields_preview", requireSecret, async (req, res) => {
-  try {
-    const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
-    const listResp = await adversusGet(`/v1/leads${search}`);
-    if (!listResp.ok) {
-      return res.status(listResp.status || 500).json({
-        ok: false, status: listResp.status, url: listResp.url,
-        error: typeof listResp.body === "string" ? listResp.body.slice(0,2000) : listResp.body
-      });
-    }
-
-    const payload = listResp.body;
-    let leads = [];
-    if (Array.isArray(payload)) leads = payload;
-    else if (payload && typeof payload === "object") {
-      for (const k of ["items","data","rows","results","list","leads"]) {
-        if (Array.isArray(payload[k])) { leads = payload[k]; break; }
-      }
-      if (!leads.length) {
-        const firstArrayKey = Object.keys(payload).find(k => Array.isArray(payload[k]));
-        if (firstArrayKey) leads = payload[firstArrayKey];
-      }
-    }
-
-    const sample = Math.max(1, Math.min(15, parseInt(String(req.query.sample || "10"),10) || 10));
-    const toScan = leads.slice(0, sample);
-
-    function fromDataArray(arr) {
-      const out = [];
-      if (!Array.isArray(arr)) return out;
-      for (const it of arr) {
-        const label = String(it?.label ?? it?.name ?? it?.title ?? it?.key ?? "").trim();
-        const id    = it?.id ?? it?.fieldId ?? (typeof it?.key === "number" ? it.key : null);
-        const value =
-          it?.value ?? it?.val ?? it?.data ?? it?.text ?? it?.content ??
-          (Array.isArray(it?.values) ? it.values.join(", ") : null);
-        if (!label && !id) continue;
-        if (value == null || String(value).trim() === "") continue;
-        out.push({ label: label || null, id: id || null, example: value });
-      }
-      return out;
-    }
-    function fromDataObject(obj) {
-      const out = [];
-      if (!obj || typeof obj !== "object" || Array.isArray(obj)) return out;
-      let pushed = false;
-      for (const [k,v] of Object.entries(obj)) {
-        if (v && typeof v === "object" && !Array.isArray(v)) {
-          const label = String(v.label ?? v.name ?? v.title ?? k).trim();
-          const id    = v.id ?? v.fieldId ?? (/^\d+$/.test(k) ? Number(k) : null);
-          let value   = v.value ?? v.val ?? v.text ?? (Array.isArray(v.values) ? v.values.join(", ") : undefined);
-          if ((label || id) && value != null && String(value).trim() !== "") {
-            out.push({ label: label || null, id: id || null, example: value });
-            pushed = true;
-          }
-        }
-      }
-      if (pushed) return out;
-      for (const [k,v] of Object.entries(obj)) {
-        if (/^\d+$/.test(k)) {
-          const id = Number(k);
-          const value = v;
-          if (value != null && String(value).trim() !== "") {
-            out.push({ label: null, id, example: value });
-          }
-        }
-      }
-      return out;
-    }
-
-    const aggById = new Map();
-    const aggByLbl = new Map();
-    const perLead = [];
-
-    const delay = (ms) => new Promise(r => setTimeout(r, ms));
-    for (const lead of toScan) {
-      const id = lead?.id ?? lead?.leadId ?? lead?.leadID;
-      if (!id) continue;
-      let hits = [];
-
-      let expanded = await adversusGet(`/v1/leads/${id}?expand=resultFields`).catch(() => null);
-      if (!expanded?.ok) expanded = await adversusGet(`/v1/leads/${id}?include=resultFields`).catch(() => null);
-
-      if (expanded?.ok && expanded.body) {
-        const body = expanded.body;
-        const candidates = [
-          body?.resultFields,
-          body?.data?.resultFields,
-          Array.isArray(body?.leads) ? body.leads[0]?.resultFields : undefined,
-          Array.isArray(body?.leads) ? body.leads[0]?.data?.resultFields : undefined,
-        ];
-        for (const c of candidates) {
-          hits.push(...fromDataArray(c), ...fromDataObject(c));
-        }
-      }
-
-      perLead.push({ leadId: id, fields: hits });
-
-      for (const f of hits) {
-        if (f.id != null) {
-          if (!aggById.has(f.id)) aggById.set(f.id, { count: 0, labelSamples: new Set(), example: f.example });
-          const a = aggById.get(f.id);
-          a.count++; if (f.label) a.labelSamples.add(f.label); if (!a.example) a.example = f.example;
-        }
-        if (f.label) {
-          if (!aggByLbl.has(f.label)) aggByLbl.set(f.label, { count: 0, idSamples: new Set(), example: f.example });
-          const a = aggByLbl.get(f.label);
-          a.count++; if (f.id != null) a.idSamples.add(f.id); if (!a.example) a.example = f.example;
-        }
-      }
-
-      await delay(450);
-    }
-
-    const byId = Array.from(aggById.entries()).map(([id, a]) => ({
-      id, labelSamples: Array.from(a.labelSamples).slice(0,3), count: a.count, example: a.example
-    })).sort((x,y) => y.count - x.count || (x.id - y.id));
-
-    const byLabel = Array.from(aggByLbl.entries()).map(([label, a]) => ({
-      label, idSamples: Array.from(a.idSamples).slice(0,3), count: a.count, example: a.example
-    })).sort((x,y) => y.count - x.count || x.label.localeCompare(y.label));
-
-    res.json({ ok: true, scanned: toScan.length, byId, byLabel, sample: perLead.slice(0,3) });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
