@@ -16,6 +16,16 @@ const DATABASE_URL = process.env.DATABASE_URL || "";
 // ==== App + middleware ====
 const app = express();
 app.use(morgan("dev"));
+
+// --- CORS (tillad lokale filer at kalde Render-domænet) ---
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*"); // evt. lås ned til din domæne senere
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, x-adversus-secret");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 app.use(express.json({ type: ["application/json", "text/plain"] }));
 app.use(express.urlencoded({ extended: false }));
 
@@ -191,7 +201,6 @@ app.get("/adversus/leads", requireSecret, async (req, res) => {
 // ==== Inspect NON-PII felter på leads (tider, status, masterData/resultData labels) ====
 app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
   try {
-    // videresend query (fx campaignId, limit)
     const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
     const r = await adversusGet(`/v1/leads${search}`);
     if (!r.ok) {
@@ -202,7 +211,6 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
     }
     const payload = r.body;
 
-    // normalisér til liste
     let rows = [];
     if (Array.isArray(payload)) rows = payload;
     else if (payload && typeof payload === "object") {
@@ -215,7 +223,6 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
       }
     }
 
-    // kun ikke-PII: direkte lead-felter + masterData/resultData arrays
     const DIRECT_KEYS = [
       "id","campaignId","created","updated","importedTime",
       "lastUpdatedTime","lastModifiedTime","nextContactTime",
@@ -235,7 +242,7 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
       return out;
     }
 
-    const seen = {}; // { fieldId: { count, example } }
+    const seen = {};
     function hit(fieldId, val) {
       if (val === undefined || val === null || (typeof val.trim === "function" && val.trim() === "")) return;
       if (!seen[fieldId]) seen[fieldId] = { count: 0, example: val };
@@ -244,10 +251,7 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
     }
 
     rows.forEach(row => {
-      // direkte felter
       DIRECT_KEYS.forEach(k => hit(k, row?.[k]));
-
-      // masterData / resultData
       const md = fromDataArray(row?.masterData);
       md.forEach(({label, value}) => hit(`masterData.${label}`, value));
       const rd = fromDataArray(row?.resultData);
@@ -265,6 +269,39 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
       .sort((a,b) => (b.coverage_pct - a.coverage_pct) || a.field.localeCompare(b.field));
 
     res.json({ ok: true, total_rows: rows.length, fields: summary });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// ==== Dashboard summary (beholder vi til senere UI) ====
+app.get("/dashboard/summary", requireSecret, async (_req, res) => {
+  if (!pgPool) return res.status(200).json({ ok: true, db: false, note: "No DB" });
+  try {
+    const [total, last24h, byType, recent] = await Promise.all([
+      pgPool.query("SELECT COUNT(*)::bigint AS c FROM adversus_events"),
+      pgPool.query("SELECT COUNT(*)::bigint AS c FROM adversus_events WHERE received_at >= now() - interval '24 hours'"),
+      pgPool.query(`
+        SELECT COALESCE(event_type,'(null)') AS event_type, COUNT(*)::bigint AS c
+        FROM adversus_events
+        WHERE received_at >= now() - interval '24 hours'
+        GROUP BY 1
+        ORDER BY c DESC, event_type ASC
+      `),
+      pgPool.query(`
+        SELECT id, received_at, event_type
+        FROM adversus_events
+        ORDER BY received_at DESC
+        LIMIT 20
+      `),
+    ]);
+    res.json({
+      ok: true,
+      db: true,
+      totals: { events_all_time: Number(total.rows[0].c), events_last_24h: Number(last24h.rows[0].c) },
+      by_type_last_24h: byType.rows.map((r) => ({ event_type: r.event_type, count: Number(r.c) })),
+      recent_events: recent.rows,
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
