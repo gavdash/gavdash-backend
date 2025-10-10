@@ -16,7 +16,6 @@ const DATABASE_URL = process.env.DATABASE_URL || "";
 // ==== App + middleware ====
 const app = express();
 app.use(morgan("dev"));
-// "text/plain" fordi nogle gateways poster det
 app.use(express.json({ type: ["application/json", "text/plain"] }));
 app.use(express.urlencoded({ extended: false }));
 
@@ -131,9 +130,7 @@ async function adversusGet(pathWithQuery) {
   const r = await fetch(url, {
     headers: { Authorization: adversusAuthHeader(), Accept: "application/json" },
     signal: controller.signal,
-  }).catch((err) => {
-    throw new Error(`Fetch failed: ${err?.name || ""} ${err?.message || err}`);
-  });
+  }).catch((err) => { throw new Error(`Fetch failed: ${err?.name || ""} ${err?.message || err}`); });
   clearTimeout(t);
   let body; try { body = await r.json(); } catch { body = await r.text(); }
   return { ok: r.ok, status: r.status, body, url };
@@ -191,56 +188,10 @@ app.get("/adversus/leads", requireSecret, async (req, res) => {
   }
 });
 
-// ==== Hjælper til at trække værdier fra "data"-lister ====
-function fromDataArray(arr, keysRegex) {
-  if (!Array.isArray(arr)) return null;
-  for (const it of arr) {
-    // typisk former: { key, name, label, value } eller { fieldId, title, value }
-    const keyName = String(it?.key ?? it?.name ?? it?.label ?? it?.title ?? "").toLowerCase();
-    if (!keyName) continue;
-    if (keysRegex.test(keyName)) {
-      const v = it?.value ?? it?.val ?? it?.data ?? it?.text ?? it?.content;
-      if (v != null && String(v).trim() !== "") return String(v);
-    }
-  }
-  return null;
-}
-function extractContactHints(ct) {
-  // normaliser alt—kør både direkte felter og data-lister igennem
-  const bag = { fullName: null, firstName: null, lastName: null, phone: null, email: null };
-
-  // direkte felter
-  const direct = (k) => {
-    const v = ct?.[k];
-    return v != null && String(v).trim() !== "" ? String(v) : null;
-  };
-  bag.firstName = direct("firstName") || direct("firstname") || direct("first_name") || null;
-  bag.lastName  = direct("lastName")  || direct("lastname")  || direct("last_name")  || null;
-  bag.fullName  = direct("fullName")  || direct("fullname")  || direct("name")       || null;
-  bag.phone     = direct("phoneNumber") || direct("phone") || direct("mobile") || null;
-  bag.email     = direct("email") || null;
-
-  // data: array af {key/name/label/title,value}
-  const d = Array.isArray(ct?.data) ? ct.data : null;
-  if (d) {
-    bag.firstName = bag.firstName || fromDataArray(d, /(first.?name|fornavn)/i);
-    bag.lastName  = bag.lastName  || fromDataArray(d, /(last.?name|efternavn)/i);
-    bag.fullName  = bag.fullName  || fromDataArray(d, /(full.?name|navn)/i);
-    bag.phone     = bag.phone     || fromDataArray(d, /(phone|telefon|mobile|mob\.?nr|tlf)/i);
-    bag.email     = bag.email     || fromDataArray(d, /(email|e-mail|mail)/i);
-  }
-
-  // fallback: hvis vi har for+efter, lav fullname
-  if (!bag.fullName && (bag.firstName || bag.lastName)) {
-    bag.fullName = [bag.firstName, bag.lastName].filter(Boolean).join(" ");
-  }
-  return bag;
-}
-
-// ==== NYT: Leads + kontaktdata (join via contactId) ====
-app.get("/adversus/leads/enriched", requireSecret, async (req, res) => {
+// ==== Inspect NON-PII felter på leads (tider, status, masterData/resultData labels) ====
+app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
   try {
-    // 1) hent leads (samme query videre)
+    // videresend query (fx campaignId, limit)
     const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
     const r = await adversusGet(`/v1/leads${search}`);
     if (!r.ok) {
@@ -249,110 +200,71 @@ app.get("/adversus/leads/enriched", requireSecret, async (req, res) => {
         error: typeof r.body === "string" ? r.body.slice(0, 2000) : r.body,
       });
     }
-
-    // 2) normalisér til liste
     const payload = r.body;
-    let items = [];
-    if (Array.isArray(payload)) items = payload;
+
+    // normalisér til liste
+    let rows = [];
+    if (Array.isArray(payload)) rows = payload;
     else if (payload && typeof payload === "object") {
-      for (const k of ["items", "data", "rows", "results", "list", "leads"]) {
-        if (Array.isArray(payload[k])) { items = payload[k]; break; }
+      for (const k of ["items","data","rows","results","list","leads"]) {
+        if (Array.isArray(payload[k])) { rows = payload[k]; break; }
       }
-      if (!items.length) {
-        const firstArrayKey = Object.keys(payload).find((k) => Array.isArray(payload[k]));
-        if (firstArrayKey) items = payload[firstArrayKey];
+      if (!rows.length) {
+        const firstArrayKey = Object.keys(payload).find(k => Array.isArray(payload[k]));
+        if (firstArrayKey) rows = payload[firstArrayKey];
       }
     }
 
-    // anvend evt. ?limit=
-    const limitQ = parseInt(String(req.query.limit ?? ""), 10);
-    const limit = Number.isFinite(limitQ) && limitQ > 0 ? limitQ : null;
-    if (limit && items.length > limit) items = items.slice(0, limit);
-
-    // 3) saml unikke contactIds
-    const contactIds = [...new Set(items.map(x => x?.contactId).filter(Boolean))];
-
-    // 4) hent kontakter (små batches) + "include=data,fields" + fallback til /data
-    async function fetchContactFull(id) {
-      // a) hoved-objekt inkl. data
-      const base = await adversusGet(`/v1/contacts/${id}?include=data,fields`);
-      let contact = base.ok ? base.body : null;
-
-      // b) fallback separat data-liste
-      const extra = await adversusGet(`/v1/contacts/${id}/data`);
-      const extraList = extra.ok && Array.isArray(extra.body) ? extra.body : null;
-
-      // merge ind
-      if (contact && extraList) {
-        const arr = Array.isArray(contact.data) ? contact.data.slice() : [];
-        contact = { ...contact, data: [...arr, ...extraList] };
-      } else if (!contact && extraList) {
-        contact = { id, data: extraList };
+    // kun ikke-PII: direkte lead-felter + masterData/resultData arrays
+    const DIRECT_KEYS = [
+      "id","campaignId","created","updated","importedTime",
+      "lastUpdatedTime","lastModifiedTime","nextContactTime",
+      "contactAttempts","contactAttemptsInvalid",
+      "lastContactedBy","status","active","vip","common_redial","externalId","import_id"
+    ];
+    function fromDataArray(arr) {
+      const out = [];
+      if (!Array.isArray(arr)) return out;
+      for (const it of arr) {
+        const label = String(it?.label ?? it?.name ?? it?.title ?? it?.key ?? "").trim();
+        const value = it?.value ?? it?.val ?? it?.data ?? it?.text ?? it?.content ?? null;
+        if (!label) continue;
+        if (value == null || String(value).trim() === "") continue;
+        out.push({ label, value });
       }
-      if (!contact) contact = { id }; // sidste fallback
-      // læg hints ind
-      const hints = extractContactHints(contact);
-      return { ...contact, contactHints: hints };
+      return out;
     }
 
-    const contacts = {};
-    const BATCH = 5;
-    for (let i = 0; i < contactIds.length; i += BATCH) {
-      const slice = contactIds.slice(i, i + BATCH);
-      const part = await Promise.all(slice.map(async (id) => {
-        try { const c = await fetchContactFull(id); return [id, c]; }
-        catch { return [id, null]; }
-      }));
-      for (const [id, c] of part) contacts[id] = c;
+    const seen = {}; // { fieldId: { count, example } }
+    function hit(fieldId, val) {
+      if (val === undefined || val === null || (typeof val.trim === "function" && val.trim() === "")) return;
+      if (!seen[fieldId]) seen[fieldId] = { count: 0, example: val };
+      seen[fieldId].count++;
+      if (seen[fieldId].example == null || seen[fieldId].example === "") seen[fieldId].example = val;
     }
 
-    // 5) join ind på hvert lead
-    const enriched = items.map(lead => {
-      const contact = lead?.contactId ? (contacts[lead.contactId] || null) : null;
-      return { ...lead, contact };
+    rows.forEach(row => {
+      // direkte felter
+      DIRECT_KEYS.forEach(k => hit(k, row?.[k]));
+
+      // masterData / resultData
+      const md = fromDataArray(row?.masterData);
+      md.forEach(({label, value}) => hit(`masterData.${label}`, value));
+      const rd = fromDataArray(row?.resultData);
+      rd.forEach(({label, value}) => hit(`resultData.${label}`, value));
     });
 
-    const totalCount =
-      (typeof payload?.total === "number" && payload.total) ||
-      (typeof payload?.count === "number" && payload.count) ||
-      (typeof payload?.totalCount === "number" && payload.totalCount) ||
-      (Array.isArray(r.body) ? r.body.length : undefined) ||
-      enriched.length;
+    const total = rows.length || 1;
+    const summary = Object.entries(seen)
+      .map(([field, info]) => ({
+        field,
+        coverage_pct: Math.round((info.count / total) * 100),
+        count: info.count,
+        example: info.example
+      }))
+      .sort((a,b) => (b.coverage_pct - a.coverage_pct) || a.field.localeCompare(b.field));
 
-    res.json({ ok: true, url: r.url, total_count: totalCount, returned: enriched.length, data: enriched });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-// ==== Dashboard summary ====
-app.get("/dashboard/summary", requireSecret, async (_req, res) => {
-  if (!pgPool) return res.status(200).json({ ok: true, db: false, note: "No DB" });
-  try {
-    const [total, last24h, byType, recent] = await Promise.all([
-      pgPool.query("SELECT COUNT(*)::bigint AS c FROM adversus_events"),
-      pgPool.query("SELECT COUNT(*)::bigint AS c FROM adversus_events WHERE received_at >= now() - interval '24 hours'"),
-      pgPool.query(`
-        SELECT COALESCE(event_type,'(null)') AS event_type, COUNT(*)::bigint AS c
-        FROM adversus_events
-        WHERE received_at >= now() - interval '24 hours'
-        GROUP BY 1
-        ORDER BY c DESC, event_type ASC
-      `),
-      pgPool.query(`
-        SELECT id, received_at, event_type
-        FROM adversus_events
-        ORDER BY received_at DESC
-        LIMIT 20
-      `),
-    ]);
-    res.json({
-      ok: true,
-      db: true,
-      totals: { events_all_time: Number(total.rows[0].c), events_last_24h: Number(last24h.rows[0].c) },
-      by_type_last_24h: byType.rows.map((r) => ({ event_type: r.event_type, count: Number(r.c) })),
-      recent_events: recent.rows,
-    });
+    res.json({ ok: true, total_rows: rows.length, fields: summary });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
