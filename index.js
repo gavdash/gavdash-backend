@@ -329,10 +329,10 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
   }
 });
 
-// ==== Inspect RESULT (fields + resultData) — deep via expand=results ====
+// ==== Inspect RESULT (resultFields + resultData) — deep på lead-niveau OG seneste result ====
 app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, res) => {
   try {
-    // 1) Hent en liste af leads som base (samme query/filters du allerede bruger)
+    // 1) Hent leade-listen som base
     const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
     const listResp = await adversusGet(`/v1/leads${search}`);
     if (!listResp.ok) {
@@ -359,45 +359,65 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
     const sample = Math.max(1, Math.min(20, parseInt(String(req.query.sample || "10"),10) || 10));
     const toScan = leads.slice(0, sample);
 
-    // helpers til at aflæse arrays/objekter med (label,value)-par
+    // helpers
     function fromDataArray(arr) {
       const out = [];
       if (!Array.isArray(arr)) return out;
       for (const it of arr) {
         const label = String(it?.label ?? it?.name ?? it?.title ?? it?.key ?? "").trim();
+        const id    = it?.id ?? it?.fieldId ?? it?.key ?? null;
         const value =
           it?.value ?? it?.val ?? it?.data ?? it?.text ?? it?.content ??
           (Array.isArray(it?.values) ? it.values.join(", ") : null);
-        if (!label) continue;
+        if (!label && !id) continue;
         if (value == null || String(value).trim() === "") continue;
-        out.push({ label, value });
+        out.push({ label, id, value });
       }
       return out;
     }
     function fromDataObject(obj) {
+      // accepter både { label:..., value:... } maps og { "96830": "1234 kr" }-objekter
       const out = [];
       if (!obj || typeof obj !== "object" || Array.isArray(obj)) return out;
+
+      // 1) hvis det ligner { labelX: {value:...}, ... }
+      let hadStructured = false;
       for (const [k,v] of Object.entries(obj)) {
-        const label = String(k).trim();
-        let value = v;
-        if (value && typeof value === "object") {
-          value = value.value ?? value.val ?? value.text ?? (Array.isArray(value.values) ? value.values.join(", ") : undefined);
+        if (v && typeof v === "object" && !Array.isArray(v)) {
+          let value = v.value ?? v.val ?? v.text ?? (Array.isArray(v.values) ? v.values.join(", ") : undefined);
+          const label = String(v.label ?? v.name ?? v.title ?? k).trim();
+          const id    = v.id ?? v.fieldId ?? (/^\d+$/.test(k) ? Number(k) : null);
+          if (label && value != null && String(value).trim() !== "") {
+            out.push({ label, id, value });
+            hadStructured = true;
+          }
         }
-        if (!label) continue;
-        if (value == null || String(value).trim?.() === "") continue;
-        out.push({ label, value });
+      }
+      if (hadStructured) return out;
+
+      // 2) hvis det ligner { "96830": "1234 kr", "12345": "…" }
+      for (const [k,v] of Object.entries(obj)) {
+        if (/^\d+$/.test(k)) {
+          const id = Number(k);
+          const value = v;
+          if (value != null && String(value).trim() !== "") {
+            out.push({ label: null, id, value });
+          }
+        }
       }
       return out;
     }
 
-    const seen = {}; // fx 'resultData.Samlet præmie hos os' -> {count, example}
+    const seen = {}; // 'resultFields.<label|id>' -> {count, example}
     const tryLog = [];
 
-    function hit(fieldId, val) {
+    function hit(prefix, label, id, val) {
       if (val == null || (typeof val === "string" && val.trim() === "")) return;
-      if (!seen[fieldId]) seen[fieldId] = { count: 0, example: val };
-      seen[fieldId].count++;
-      if (seen[fieldId].example == null || seen[fieldId].example === "") seen[fieldId].example = val;
+      const key = label ? `${prefix}.${label}` : (id ? `${prefix}.${id}` : null);
+      if (!key) return;
+      if (!seen[key]) seen[key] = { count: 0, example: val };
+      seen[key].count++;
+      if (seen[key].example == null || seen[key].example === "") seen[key].example = val;
     }
 
     const delay = (ms) => new Promise(r => setTimeout(r, ms));
@@ -406,37 +426,59 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
       const id = lead?.id ?? lead?.leadId ?? lead?.leadID;
       if (!id) continue;
 
-      // Brug expand=results (det var her din probe fandt data)
+      // A) Prøv lead med resultFields direkte: expand=resultFields
+      let expanded = await adversusGet(`/v1/leads/${id}?expand=resultFields`).catch(() => null);
+      if (!expanded?.ok) {
+        // nogle konti bruger include=
+        expanded = await adversusGet(`/v1/leads/${id}?include=resultFields`).catch(() => null);
+      }
+      if (expanded?.ok && expanded.body) {
+        const body = expanded.body;
+        // mulige placeringer
+        const candidates = [
+          body?.resultFields,
+          body?.data?.resultFields,
+          Array.isArray(body?.leads) ? body.leads[0]?.resultFields : undefined,
+          Array.isArray(body?.leads) ? body.leads[0]?.data?.resultFields : undefined,
+        ];
+        candidates.forEach(c => {
+          fromDataArray(c).forEach(({label,id,value}) => hit("resultFields", label, id, value));
+          fromDataObject(c).forEach(({label,id,value}) => hit("resultFields", label, id, value));
+        });
+        tryLog.push({ id, endpoint: "leads/{id}?expand/include=resultFields", got: true });
+      } else {
+        tryLog.push({ id, endpoint: "leads/{id}?expand/include=resultFields", got: false });
+      }
+
+      // B) Tjek seneste resultater (expand=results) for resultFields/resultData
       const p = await adversusGet(`/v1/leads/${id}?expand=results`).catch(() => null);
       if (p?.ok && p.body && typeof p.body === "object") {
-        // resultater kan ligge i body.results eller body.leads[0].resultData (som din shape_probe viste)
         let results = Array.isArray(p.body?.results) ? p.body.results : null;
         if (!results && Array.isArray(p.body?.leads)) {
-          // nogle svar former: { leads: [ { ..., results: [...] } ] }
           const first = p.body.leads[0];
           if (first && Array.isArray(first.results)) results = first.results;
-          // din probe viste "lead_expand_results.leads.[0].resultData" – så tjek også direkte resultData på lead
+          // fallback: hvis leadet har resultData/resultFields direkte
           if (!results && (first?.resultData || first?.resultFields)) {
-            // fake et “resultat” objekt så vi kan reuse scanning
             results = [{ resultData: first.resultData, resultFields: first.resultFields }];
           }
         }
-
         if (Array.isArray(results) && results.length) {
-          // vælg seneste
           results.sort((a,b) => new Date(b?.created||b?.updated||0) - new Date(a?.created||a?.updated||0));
           const latest = results[0];
-
-          // SCAN: både resultFields og resultData (array + objekt)
           const places = [
-            latest?.resultFields, latest?.fields,       // nogle konti
-            latest?.resultData,  latest?.data?.resultData // hos jer
+            latest?.resultFields, latest?.fields,
+            latest?.resultData, latest?.data?.resultData
           ];
-          for (const p of places) {
-            fromDataArray(p).forEach(({label,value}) => hit(`resultData.${label}`, value));
-            fromDataObject(p).forEach(({label,value}) => hit(`resultData.${label}`, value));
-          }
-
+          places.forEach(c => {
+            fromDataArray(c).forEach(({label,id,value}) => {
+              const pref = (c === latest?.resultData || c === latest?.data?.resultData) ? "resultData" : "resultFields";
+              hit(pref, label, id, value);
+            });
+            fromDataObject(c).forEach(({label,id,value}) => {
+              const pref = (c === latest?.resultData || c === latest?.data?.resultData) ? "resultData" : "resultFields";
+              hit(pref, label, id, value);
+            });
+          });
           tryLog.push({ id, endpoint: "leads/{id}?expand=results", got: true });
         } else {
           tryLog.push({ id, endpoint: "leads/{id}?expand=results", got: false });
@@ -445,8 +487,7 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
         tryLog.push({ id, endpoint: "leads/{id}?expand=results", got: false });
       }
 
-      // throttle (rolig trafik: ~60/min)
-      await delay(800);
+      await delay(700); // ~85/min (vi scanner få leads => under 60/min i praksis)
     }
 
     const fields = Object.entries(seen)
@@ -464,6 +505,7 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
+
 
 
 // ==== Start server ====
