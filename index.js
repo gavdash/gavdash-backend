@@ -17,9 +17,9 @@ const DATABASE_URL = process.env.DATABASE_URL || "";
 const app = express();
 app.use(morgan("dev"));
 
-// --- CORS (tillad lokale filer at kalde Render-domænet) ---
+// CORS – så din lokale HTML kan kalde Render
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*"); // evt. lås ned til din domæne senere
+  res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, x-adversus-secret");
   if (req.method === "OPTIONS") return res.sendStatus(204);
@@ -198,7 +198,7 @@ app.get("/adversus/leads", requireSecret, async (req, res) => {
   }
 });
 
-// ==== Inspect NON-PII felter på leads (tider, status, masterData/resultData labels) ====
+// ==== Inspect NON-PII felter (forbedret: arrays ELLER objekter, + deep) ====
 app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
   try {
     const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
@@ -211,6 +211,7 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
     }
     const payload = r.body;
 
+    // normalisér liste
     let rows = [];
     if (Array.isArray(payload)) rows = payload;
     else if (payload && typeof payload === "object") {
@@ -223,26 +224,48 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
       }
     }
 
+    // hvilke direkte felter (non-PII) vi måler
     const DIRECT_KEYS = [
       "id","campaignId","created","updated","importedTime",
       "lastUpdatedTime","lastModifiedTime","nextContactTime",
       "contactAttempts","contactAttemptsInvalid",
       "lastContactedBy","status","active","vip","common_redial","externalId","import_id"
     ];
+
     function fromDataArray(arr) {
       const out = [];
       if (!Array.isArray(arr)) return out;
       for (const it of arr) {
         const label = String(it?.label ?? it?.name ?? it?.title ?? it?.key ?? "").trim();
-        const value = it?.value ?? it?.val ?? it?.data ?? it?.text ?? it?.content ?? null;
+        // værdi kan hedde meget – tag første bedste
+        const value =
+          it?.value ?? it?.val ?? it?.data ?? it?.text ?? it?.content ??
+          (Array.isArray(it?.values) ? it.values.join(", ") : null);
         if (!label) continue;
         if (value == null || String(value).trim() === "") continue;
         out.push({ label, value });
       }
       return out;
     }
+    // NYT: hvis masterData/resultData er et OBJEKT i stedet for en array
+    function fromDataObject(obj) {
+      const out = [];
+      if (!obj || typeof obj !== "object" || Array.isArray(obj)) return out;
+      for (const [k,v] of Object.entries(obj)) {
+        const label = String(k).trim();
+        let value = v;
+        if (value && typeof value === "object") {
+          // almindelige former: { value: "x" } eller { text: ... } eller { values: [...] }
+          value = value.value ?? value.val ?? value.text ?? (Array.isArray(value.values) ? value.values.join(", ") : undefined);
+        }
+        if (!label) continue;
+        if (value == null || String(value).trim?.() === "") continue;
+        out.push({ label, value });
+      }
+      return out;
+    }
 
-    const seen = {};
+    const seen = {}; // { fieldId: { count, example } }
     function hit(fieldId, val) {
       if (val === undefined || val === null || (typeof val.trim === "function" && val.trim() === "")) return;
       if (!seen[fieldId]) seen[fieldId] = { count: 0, example: val };
@@ -251,11 +274,32 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
     }
 
     rows.forEach(row => {
+      // direkte felter
       DIRECT_KEYS.forEach(k => hit(k, row?.[k]));
-      const md = fromDataArray(row?.masterData);
-      md.forEach(({label, value}) => hit(`masterData.${label}`, value));
-      const rd = fromDataArray(row?.resultData);
-      rd.forEach(({label, value}) => hit(`resultData.${label}`, value));
+
+      // masterData/resultData – både array OG objekt, plus deep fallback hvis nogen har lagt under f.eks. row.data.masterData
+      const mdArr = fromDataArray(row?.masterData) || [];
+      mdArr.forEach(({label, value}) => hit(`masterData.${label}`, value));
+
+      const rdArr = fromDataArray(row?.resultData) || [];
+      rdArr.forEach(({label, value}) => hit(`resultData.${label}`, value));
+
+      const mdObj = fromDataObject(row?.masterData) || [];
+      mdObj.forEach(({label, value}) => hit(`masterData.${label}`, value));
+
+      const rdObj = fromDataObject(row?.resultData) || [];
+      rdObj.forEach(({label, value}) => hit(`resultData.${label}`, value));
+
+      // faldbak: hvis nogle lægger under row.data.masterData / row.data.resultData
+      const deepMDarr = fromDataArray(row?.data?.masterData) || [];
+      deepMDarr.forEach(({label, value}) => hit(`masterData.${label}`, value));
+      const deepRDarr = fromDataArray(row?.data?.resultData) || [];
+      deepRDarr.forEach(({label, value}) => hit(`resultData.${label}`, value));
+
+      const deepMDobj = fromDataObject(row?.data?.masterData) || [];
+      deepMDobj.forEach(({label, value}) => hit(`masterData.${label}`, value));
+      const deepRDobj = fromDataObject(row?.data?.resultData) || [];
+      deepRDobj.forEach(({label, value}) => hit(`resultData.${label}`, value));
     });
 
     const total = rows.length || 1;
@@ -269,39 +313,6 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
       .sort((a,b) => (b.coverage_pct - a.coverage_pct) || a.field.localeCompare(b.field));
 
     res.json({ ok: true, total_rows: rows.length, fields: summary });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-// ==== Dashboard summary (beholder vi til senere UI) ====
-app.get("/dashboard/summary", requireSecret, async (_req, res) => {
-  if (!pgPool) return res.status(200).json({ ok: true, db: false, note: "No DB" });
-  try {
-    const [total, last24h, byType, recent] = await Promise.all([
-      pgPool.query("SELECT COUNT(*)::bigint AS c FROM adversus_events"),
-      pgPool.query("SELECT COUNT(*)::bigint AS c FROM adversus_events WHERE received_at >= now() - interval '24 hours'"),
-      pgPool.query(`
-        SELECT COALESCE(event_type,'(null)') AS event_type, COUNT(*)::bigint AS c
-        FROM adversus_events
-        WHERE received_at >= now() - interval '24 hours'
-        GROUP BY 1
-        ORDER BY c DESC, event_type ASC
-      `),
-      pgPool.query(`
-        SELECT id, received_at, event_type
-        FROM adversus_events
-        ORDER BY received_at DESC
-        LIMIT 20
-      `),
-    ]);
-    res.json({
-      ok: true,
-      db: true,
-      totals: { events_all_time: Number(total.rows[0].c), events_last_24h: Number(last24h.rows[0].c) },
-      by_type_last_24h: byType.rows.map((r) => ({ event_type: r.event_type, count: Number(r.c) })),
-      recent_events: recent.rows,
-    });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
