@@ -17,7 +17,7 @@ const DATABASE_URL = process.env.DATABASE_URL || "";
 const app = express();
 app.use(morgan("dev"));
 
-// CORS – så din lokale HTML kan kalde Render
+// CORS – så lokale HTML-filer/localhost kan kalde Render-API’et
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -89,7 +89,9 @@ async function initDb() {
 initDb().catch((err) => console.error("DB init error:", err));
 
 // ==== Health / Debug ====
-app.get("/health", (_req, res) => res.json({ status: "ok", uptime: process.uptime(), time: new Date().toISOString() }));
+app.get("/health", (_req, res) =>
+  res.json({ status: "ok", uptime: process.uptime(), time: new Date().toISOString() })
+);
 app.get("/_show-secret", (req, res) => res.json(readSecrets(req)));
 app.get("/_debug/events", requireSecret, (_req, res) => res.json(lastEvents.slice(0, 100)));
 app.get("/debug/events", requireSecret, (_req, res) => res.json(lastEvents.slice(0, 100)));
@@ -124,7 +126,10 @@ app.post("/webhook/adversus", requireSecret, async (req, res) => {
 
   if (pgPool) {
     try {
-      await pgPool.query("INSERT INTO adversus_events (event_type, payload) VALUES ($1, $2)", [eventType, payload]);
+      await pgPool.query("INSERT INTO adversus_events (event_type, payload) VALUES ($1, $2)", [
+        eventType,
+        payload,
+      ]);
     } catch (e) {
       console.error("DB insert failed:", e);
     }
@@ -140,9 +145,16 @@ async function adversusGet(pathWithQuery) {
   const r = await fetch(url, {
     headers: { Authorization: adversusAuthHeader(), Accept: "application/json" },
     signal: controller.signal,
-  }).catch((err) => { throw new Error(`Fetch failed: ${err?.name || ""} ${err?.message || err}`); });
+  }).catch((err) => {
+    throw new Error(`Fetch failed: ${err?.name || ""} ${err?.message || err}`);
+  });
   clearTimeout(t);
-  let body; try { body = await r.json(); } catch { body = await r.text(); }
+  let body;
+  try {
+    body = await r.json();
+  } catch {
+    body = await r.text();
+  }
   return { ok: r.ok, status: r.status, body, url };
 }
 
@@ -150,11 +162,21 @@ async function adversusGet(pathWithQuery) {
 app.get("/adversus/campaigns", requireSecret, async (_req, res) => {
   try {
     const r = await adversusGet("/v1/campaigns");
-    if (!r.ok) return res.status(r.status || 500).json({ ok: false, status: r.status, url: r.url, error: typeof r.body === "string" ? r.body.slice(0, 2000) : r.body });
+    if (!r.ok)
+      return res
+        .status(r.status || 500)
+        .json({ ok: false, status: r.status, url: r.url, error: typeof r.body === "string" ? r.body.slice(0, 2000) : r.body });
     const raw = r.body;
     const totalCount = Array.isArray(raw) ? raw.length : undefined;
     const data = Array.isArray(raw) ? raw.slice(0, 200) : raw;
-    res.json({ ok: true, url: r.url, total_count: totalCount, returned: Array.isArray(data) ? data.length : undefined, truncated: typeof totalCount === "number" ? totalCount > 200 : undefined, data });
+    res.json({
+      ok: true,
+      url: r.url,
+      total_count: totalCount,
+      returned: Array.isArray(data) ? data.length : undefined,
+      truncated: typeof totalCount === "number" ? totalCount > 200 : undefined,
+      data,
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
@@ -165,14 +187,20 @@ app.get("/adversus/leads", requireSecret, async (req, res) => {
   try {
     const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
     const r = await adversusGet(`/v1/leads${search}`);
-    if (!r.ok) return res.status(r.status || 500).json({ ok: false, status: r.status, url: r.url, error: typeof r.body === "string" ? r.body.slice(0, 2000) : r.body });
+    if (!r.ok)
+      return res
+        .status(r.status || 500)
+        .json({ ok: false, status: r.status, url: r.url, error: typeof r.body === "string" ? r.body.slice(0, 2000) : r.body });
 
     const payload = r.body;
     let items = [];
     if (Array.isArray(payload)) items = payload;
     else if (payload && typeof payload === "object") {
       for (const k of ["items", "data", "rows", "results", "list", "leads"]) {
-        if (Array.isArray(payload[k])) { items = payload[k]; break; }
+        if (Array.isArray(payload[k])) {
+          items = payload[k];
+          break;
+        }
       }
       if (!items.length) {
         const firstArrayKey = Object.keys(payload).find((k) => Array.isArray(payload[k]));
@@ -183,7 +211,10 @@ app.get("/adversus/leads", requireSecret, async (req, res) => {
     const limitQ = parseInt(String(req.query.limit ?? ""), 10);
     const limit = Number.isFinite(limitQ) && limitQ > 0 ? limitQ : null;
     let truncated = false;
-    if (limit && items.length > limit) { items = items.slice(0, limit); truncated = true; }
+    if (limit && items.length > limit) {
+      items = items.slice(0, limit);
+      truncated = true;
+    }
 
     const totalCount =
       (typeof payload?.total === "number" && payload.total) ||
@@ -198,14 +229,16 @@ app.get("/adversus/leads", requireSecret, async (req, res) => {
   }
 });
 
-// ==== Inspect NON-PII felter (nu også resultFields) ====
+// ==== Inspect NON-PII felter (masterData/resultData + deep + arrays/objekter) ====
 app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
   try {
     const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
     const r = await adversusGet(`/v1/leads${search}`);
     if (!r.ok) {
       return res.status(r.status || 500).json({
-        ok: false, status: r.status, url: r.url,
+        ok: false,
+        status: r.status,
+        url: r.url,
         error: typeof r.body === "string" ? r.body.slice(0, 2000) : r.body,
       });
     }
@@ -215,20 +248,36 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
     let rows = [];
     if (Array.isArray(payload)) rows = payload;
     else if (payload && typeof payload === "object") {
-      for (const k of ["items","data","rows","results","list","leads"]) {
-        if (Array.isArray(payload[k])) { rows = payload[k]; break; }
+      for (const k of ["items", "data", "rows", "results", "list", "leads"]) {
+        if (Array.isArray(payload[k])) {
+          rows = payload[k];
+          break;
+        }
       }
       if (!rows.length) {
-        const firstArrayKey = Object.keys(payload).find(k => Array.isArray(payload[k]));
+        const firstArrayKey = Object.keys(payload).find((k) => Array.isArray(payload[k]));
         if (firstArrayKey) rows = payload[firstArrayKey];
       }
     }
 
     const DIRECT_KEYS = [
-      "id","campaignId","created","updated","importedTime",
-      "lastUpdatedTime","lastModifiedTime","nextContactTime",
-      "contactAttempts","contactAttemptsInvalid",
-      "lastContactedBy","status","active","vip","common_redial","externalId","import_id"
+      "id",
+      "campaignId",
+      "created",
+      "updated",
+      "importedTime",
+      "lastUpdatedTime",
+      "lastModifiedTime",
+      "nextContactTime",
+      "contactAttempts",
+      "contactAttemptsInvalid",
+      "lastContactedBy",
+      "status",
+      "active",
+      "vip",
+      "common_redial",
+      "externalId",
+      "import_id",
     ];
 
     function fromDataArray(arr) {
@@ -237,8 +286,7 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
       for (const it of arr) {
         const label = String(it?.label ?? it?.name ?? it?.title ?? it?.key ?? "").trim();
         const value =
-          it?.value ?? it?.val ?? it?.data ?? it?.text ?? it?.content ??
-          (Array.isArray(it?.values) ? it.values.join(", ") : null);
+          it?.value ?? it?.val ?? it?.data ?? it?.text ?? it?.content ?? (Array.isArray(it?.values) ? it.values.join(", ") : null);
         if (!label) continue;
         if (value == null || String(value).trim() === "") continue;
         out.push({ label, value });
@@ -248,7 +296,7 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
     function fromDataObject(obj) {
       const out = [];
       if (!obj || typeof obj !== "object" || Array.isArray(obj)) return out;
-      for (const [k,v] of Object.entries(obj)) {
+      for (const [k, v] of Object.entries(obj)) {
         const label = String(k).trim();
         let value = v;
         if (value && typeof value === "object") {
@@ -269,36 +317,21 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
       if (seen[fieldId].example == null || seen[fieldId].example === "") seen[fieldId].example = val;
     }
 
-    rows.forEach(row => {
+    rows.forEach((row) => {
       // direkte felter
-      DIRECT_KEYS.forEach(k => hit(k, row?.[k]));
+      DIRECT_KEYS.forEach((k) => hit(k, row?.[k]));
 
       // master/result arrays/objekter
-      fromDataArray(row?.masterData).forEach(({label,value}) => hit(`masterData.${label}`, value));
-      fromDataArray(row?.resultData).forEach(({label,value}) => hit(`resultData.${label}`, value));
-      fromDataObject(row?.masterData).forEach(({label,value}) => hit(`masterData.${label}`, value));
-      fromDataObject(row?.resultData).forEach(({label,value}) => hit(`resultData.${label}`, value));
+      fromDataArray(row?.masterData).forEach(({ label, value }) => hit(`masterData.${label}`, value));
+      fromDataArray(row?.resultData).forEach(({ label, value }) => hit(`resultData.${label}`, value));
+      fromDataObject(row?.masterData).forEach(({ label, value }) => hit(`masterData.${label}`, value));
+      fromDataObject(row?.resultData).forEach(({ label, value }) => hit(`resultData.${label}`, value));
 
       // deep under data.*
-      fromDataArray(row?.data?.masterData).forEach(({label,value}) => hit(`masterData.${label}`, value));
-      fromDataArray(row?.data?.resultData).forEach(({label,value}) => hit(`resultData.${label}`, value));
-      fromDataObject(row?.data?.masterData).forEach(({label,value}) => hit(`masterData.${label}`, value));
-      fromDataObject(row?.data?.resultData).forEach(({label,value}) => hit(`resultData.${label}`, value));
-
-      // >>> NYT: resultFields (array OG objekt) + almindelige “last result” placeringer
-      const rfPlaces = [
-        row?.resultFields,
-        row?.data?.resultFields,
-        row?.lastResult?.resultFields,
-        row?.lastCall?.resultFields,
-        row?.callResult?.resultFields,
-        row?.result?.fields,          // nogle modeller
-        row?.lastResult?.fields,
-      ];
-      rfPlaces.forEach(p => {
-        fromDataArray(p).forEach(({label,value}) => hit(`resultFields.${label}`, value));
-        fromDataObject(p).forEach(({label,value}) => hit(`resultFields.${label}`, value));
-      });
+      fromDataArray(row?.data?.masterData).forEach(({ label, value }) => hit(`masterData.${label}`, value));
+      fromDataArray(row?.data?.resultData).forEach(({ label, value }) => hit(`resultData.${label}`, value));
+      fromDataObject(row?.data?.masterData).forEach(({ label, value }) => hit(`masterData.${label}`, value));
+      fromDataObject(row?.data?.resultData).forEach(({ label, value }) => hit(`resultData.${label}`, value));
     });
 
     const total = rows.length || 1;
@@ -307,11 +340,120 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
         field,
         coverage_pct: Math.round((info.count / total) * 100),
         count: info.count,
-        example: info.example
+        example: info.example,
       }))
-      .sort((a,b) => (b.coverage_pct - a.coverage_pct) || a.field.localeCompare(b.field));
+      .sort((a, b) => b.coverage_pct - a.coverage_pct || a.field.localeCompare(b.field));
 
     res.json({ ok: true, total_rows: rows.length, fields: summary });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// ==== Inspect RESULT FIELDS (scanner efter resultFields.*) ====
+app.get("/adversus/leads/inspect_resultfields", requireSecret, async (req, res) => {
+  try {
+    // 1) hent leads-listen (samme query som du ellers ville bruge)
+    const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
+    const r = await adversusGet(`/v1/leads${search}`);
+    if (!r.ok) {
+      return res.status(r.status || 500).json({
+        ok: false,
+        status: r.status,
+        url: r.url,
+        error: typeof r.body === "string" ? r.body.slice(0, 2000) : r.body,
+      });
+    }
+
+    // normalisér liste
+    const payload = r.body;
+    let rows = [];
+    if (Array.isArray(payload)) rows = payload;
+    else if (payload && typeof payload === "object") {
+      for (const k of ["items", "data", "rows", "results", "list", "leads"]) {
+        if (Array.isArray(payload[k])) {
+          rows = payload[k];
+          break;
+        }
+      }
+      if (!rows.length) {
+        const firstArrayKey = Object.keys(payload).find((k) => Array.isArray(payload[k]));
+        if (firstArrayKey) rows = payload[firstArrayKey];
+      }
+    }
+
+    // 2) vælg hvor mange leads vi scanner (default 20, max 40)
+    const sample = Math.max(1, Math.min(40, parseInt(String(req.query.sample || "20"), 10) || 20));
+    const toScan = rows.slice(0, sample);
+
+    // helpers til at aflæse arrays/objekter
+    function fromDataArray(arr) {
+      const out = [];
+      if (!Array.isArray(arr)) return out;
+      for (const it of arr) {
+        const label = String(it?.label ?? it?.name ?? it?.title ?? it?.key ?? "").trim();
+        const value =
+          it?.value ?? it?.val ?? it?.data ?? it?.text ?? it?.content ?? (Array.isArray(it?.values) ? it.values.join(", ") : null);
+        if (!label) continue;
+        if (value == null || String(value).trim() === "") continue;
+        out.push({ label, value });
+      }
+      return out;
+    }
+    function fromDataObject(obj) {
+      const out = [];
+      if (!obj || typeof obj !== "object" || Array.isArray(obj)) return out;
+      for (const [k, v] of Object.entries(obj)) {
+        const label = String(k).trim();
+        let value = v;
+        if (value && typeof value === "object") {
+          value = value.value ?? value.val ?? value.text ?? (Array.isArray(value.values) ? value.values.join(", ") : undefined);
+        }
+        if (!label) continue;
+        if (value == null || String(value).trim?.() === "") continue;
+        out.push({ label, value });
+      }
+      return out;
+    }
+
+    const seen = {}; // 'resultFields.<label>' -> {count, example}
+    function hit(fieldId, val) {
+      if (val === undefined || val === null || (typeof val.trim === "function" && val.trim() === "")) return;
+      if (!seen[fieldId]) seen[fieldId] = { count: 0, example: val };
+      seen[fieldId].count++;
+      if (seen[fieldId].example == null || seen[fieldId].example === "") seen[fieldId].example = val;
+    }
+
+    // 3) Scan lokalt på lead-objektet efter resultFields i typiske placeringer – sekventielt, throttlet
+    const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+    for (const lead of toScan) {
+      const candidates = [
+        lead?.resultFields,
+        lead?.data?.resultFields,
+        lead?.lastResult?.resultFields,
+        lead?.lastCall?.resultFields,
+        lead?.callResult?.resultFields,
+        lead?.result?.fields, // nogle modeller
+        lead?.lastResult?.fields,
+      ];
+      for (const p of candidates) {
+        fromDataArray(p).forEach(({ label, value }) => hit(`resultFields.${label}`, value));
+        fromDataObject(p).forEach(({ label, value }) => hit(`resultFields.${label}`, value));
+      }
+      // throttle (hold os langt under 60/min og 2 concurrent)
+      await delay(600);
+    }
+
+    const fields = Object.entries(seen)
+      .map(([field, info]) => ({ field, count: info.count, example: info.example }))
+      .sort((a, b) => b.count - a.count || a.field.localeCompare(b.field));
+
+    res.json({
+      ok: true,
+      total_returned: rows.length,
+      scanned: toScan.length,
+      fields,
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
