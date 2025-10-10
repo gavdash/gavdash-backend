@@ -332,7 +332,6 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
 // ==== Inspect RESULT (resultFields + resultData) — deep på lead-niveau OG seneste result ====
 app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, res) => {
   try {
-    // 1) Hent leade-listen som base
     const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
     const listResp = await adversusGet(`/v1/leads${search}`);
     if (!listResp.ok) {
@@ -359,43 +358,40 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
     const sample = Math.max(1, Math.min(20, parseInt(String(req.query.sample || "10"),10) || 10));
     const toScan = leads.slice(0, sample);
 
-    // helpers
     function fromDataArray(arr) {
       const out = [];
       if (!Array.isArray(arr)) return out;
       for (const it of arr) {
         const label = String(it?.label ?? it?.name ?? it?.title ?? it?.key ?? "").trim();
-        const id    = it?.id ?? it?.fieldId ?? it?.key ?? null;
+        const id    = it?.id ?? it?.fieldId ?? (typeof it?.key === "number" ? it.key : null);
         const value =
           it?.value ?? it?.val ?? it?.data ?? it?.text ?? it?.content ??
           (Array.isArray(it?.values) ? it.values.join(", ") : null);
         if (!label && !id) continue;
         if (value == null || String(value).trim() === "") continue;
-        out.push({ label, id, value });
+        out.push({ label: label || null, id: id || null, value });
       }
       return out;
     }
     function fromDataObject(obj) {
-      // accepter både { label:..., value:... } maps og { "96830": "1234 kr" }-objekter
       const out = [];
       if (!obj || typeof obj !== "object" || Array.isArray(obj)) return out;
 
-      // 1) hvis det ligner { labelX: {value:...}, ... }
-      let hadStructured = false;
+      let structured = false;
       for (const [k,v] of Object.entries(obj)) {
         if (v && typeof v === "object" && !Array.isArray(v)) {
-          let value = v.value ?? v.val ?? v.text ?? (Array.isArray(v.values) ? v.values.join(", ") : undefined);
           const label = String(v.label ?? v.name ?? v.title ?? k).trim();
           const id    = v.id ?? v.fieldId ?? (/^\d+$/.test(k) ? Number(k) : null);
-          if (label && value != null && String(value).trim() !== "") {
-            out.push({ label, id, value });
-            hadStructured = true;
+          let value   = v.value ?? v.val ?? v.text ?? (Array.isArray(v.values) ? v.values.join(", ") : undefined);
+          if ((label || id) && value != null && String(value).trim() !== "") {
+            out.push({ label: label || null, id: id || null, value });
+            structured = true;
           }
         }
       }
-      if (hadStructured) return out;
+      if (structured) return out;
 
-      // 2) hvis det ligner { "96830": "1234 kr", "12345": "…" }
+      // fallback: { "96830": "1234 kr" }
       for (const [k,v] of Object.entries(obj)) {
         if (/^\d+$/.test(k)) {
           const id = Number(k);
@@ -408,9 +404,8 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
       return out;
     }
 
-    const seen = {}; // 'resultFields.<label|id>' -> {count, example}
+    const seen = {};
     const tryLog = [];
-
     function hit(prefix, label, id, val) {
       if (val == null || (typeof val === "string" && val.trim() === "")) return;
       const key = label ? `${prefix}.${label}` : (id ? `${prefix}.${id}` : null);
@@ -419,22 +414,17 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
       seen[key].count++;
       if (seen[key].example == null || seen[key].example === "") seen[key].example = val;
     }
-
     const delay = (ms) => new Promise(r => setTimeout(r, ms));
 
     for (const lead of toScan) {
       const id = lead?.id ?? lead?.leadId ?? lead?.leadID;
       if (!id) continue;
 
-      // A) Prøv lead med resultFields direkte: expand=resultFields
+      // A) resultFields direkte på lead
       let expanded = await adversusGet(`/v1/leads/${id}?expand=resultFields`).catch(() => null);
-      if (!expanded?.ok) {
-        // nogle konti bruger include=
-        expanded = await adversusGet(`/v1/leads/${id}?include=resultFields`).catch(() => null);
-      }
+      if (!expanded?.ok) expanded = await adversusGet(`/v1/leads/${id}?include=resultFields`).catch(() => null);
       if (expanded?.ok && expanded.body) {
         const body = expanded.body;
-        // mulige placeringer
         const candidates = [
           body?.resultFields,
           body?.data?.resultFields,
@@ -450,14 +440,13 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
         tryLog.push({ id, endpoint: "leads/{id}?expand/include=resultFields", got: false });
       }
 
-      // B) Tjek seneste resultater (expand=results) for resultFields/resultData
+      // B) seneste resultater – både resultFields og resultData
       const p = await adversusGet(`/v1/leads/${id}?expand=results`).catch(() => null);
       if (p?.ok && p.body && typeof p.body === "object") {
         let results = Array.isArray(p.body?.results) ? p.body.results : null;
         if (!results && Array.isArray(p.body?.leads)) {
           const first = p.body.leads[0];
           if (first && Array.isArray(first.results)) results = first.results;
-          // fallback: hvis leadet har resultData/resultFields direkte
           if (!results && (first?.resultData || first?.resultFields)) {
             results = [{ resultData: first.resultData, resultFields: first.resultFields }];
           }
@@ -465,10 +454,7 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
         if (Array.isArray(results) && results.length) {
           results.sort((a,b) => new Date(b?.created||b?.updated||0) - new Date(a?.created||a?.updated||0));
           const latest = results[0];
-          const places = [
-            latest?.resultFields, latest?.fields,
-            latest?.resultData, latest?.data?.resultData
-          ];
+          const places = [ latest?.resultFields, latest?.fields, latest?.resultData, latest?.data?.resultData ];
           places.forEach(c => {
             fromDataArray(c).forEach(({label,id,value}) => {
               const pref = (c === latest?.resultData || c === latest?.data?.resultData) ? "resultData" : "resultFields";
@@ -487,26 +473,151 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
         tryLog.push({ id, endpoint: "leads/{id}?expand=results", got: false });
       }
 
-      await delay(700); // ~85/min (vi scanner få leads => under 60/min i praksis)
+      await delay(700);
     }
 
     const fields = Object.entries(seen)
       .map(([field, info]) => ({ field, count: info.count, example: info.example }))
       .sort((a,b) => b.count - a.count || a.field.localeCompare(b.field));
 
-    res.json({
-      ok: true,
-      total_returned: leads.length,
-      scanned: toScan.length,
-      fields,
-      diag: tryLog
-    });
+    res.json({ ok: true, total_returned: leads.length, scanned: toScan.length, fields, diag: tryLog });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
+// ---- PREVIEW: resultFields pr. lead (label + id + eksempel) ----
+app.get("/adversus/leads/resultfields_preview", requireSecret, async (req, res) => {
+  try {
+    const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
+    const listResp = await adversusGet(`/v1/leads${search}`);
+    if (!listResp.ok) {
+      return res.status(listResp.status || 500).json({
+        ok: false, status: listResp.status, url: listResp.url,
+        error: typeof listResp.body === "string" ? r.body.slice(0,2000) : listResp.body
+      });
+    }
 
+    // normaliser lead-liste
+    const payload = listResp.body;
+    let leads = [];
+    if (Array.isArray(payload)) leads = payload;
+    else if (payload && typeof payload === "object") {
+      for (const k of ["items","data","rows","results","list","leads"]) {
+        if (Array.isArray(payload[k])) { leads = payload[k]; break; }
+      }
+      if (!leads.length) {
+        const firstArrayKey = Object.keys(payload).find(k => Array.isArray(payload[k]));
+        if (firstArrayKey) leads = payload[firstArrayKey];
+      }
+    }
+
+    const sample = Math.max(1, Math.min(15, parseInt(String(req.query.sample || "10"),10) || 10));
+    const toScan = leads.slice(0, sample);
+
+    function fromDataArray(arr) {
+      const out = [];
+      if (!Array.isArray(arr)) return out;
+      for (const it of arr) {
+        const label = String(it?.label ?? it?.name ?? it?.title ?? it?.key ?? "").trim();
+        const id    = it?.id ?? it?.fieldId ?? (typeof it?.key === "number" ? it.key : null);
+        const value =
+          it?.value ?? it?.val ?? it?.data ?? it?.text ?? it?.content ??
+          (Array.isArray(it?.values) ? it.values.join(", ") : null);
+        if (!label && !id) continue;
+        if (value == null || String(value).trim() === "") continue;
+        out.push({ label: label || null, id: id || null, example: value });
+      }
+      return out;
+    }
+    function fromDataObject(obj) {
+      const out = [];
+      if (!obj || typeof obj !== "object" || Array.isArray(obj)) return out;
+
+      let pushed = false;
+      for (const [k,v] of Object.entries(obj)) {
+        if (v && typeof v === "object" && !Array.isArray(v)) {
+          const label = String(v.label ?? v.name ?? v.title ?? k).trim();
+          const id    = v.id ?? v.fieldId ?? (/^\d+$/.test(k) ? Number(k) : null);
+          let value   = v.value ?? v.val ?? v.text ?? (Array.isArray(v.values) ? v.values.join(", ") : undefined);
+          if ((label || id) && value != null && String(value).trim() !== "") {
+            out.push({ label: label || null, id: id || null, example: value });
+            pushed = true;
+          }
+        }
+      }
+      if (pushed) return out;
+
+      // fallback: { "96830": "1234 kr" }
+      for (const [k,v] of Object.entries(obj)) {
+        if (/^\d+$/.test(k)) {
+          const id = Number(k);
+          const value = v;
+          if (value != null && String(value).trim() !== "") {
+            out.push({ label: null, id, example: value });
+          }
+        }
+      }
+      return out;
+    }
+
+    const aggById = new Map();
+    const aggByLbl = new Map();
+    const perLead = [];
+
+    const delay = (ms) => new Promise(r => setTimeout(r, ms));
+    for (const lead of toScan) {
+      const id = lead?.id ?? lead?.leadId ?? lead?.leadID;
+      if (!id) continue;
+      let hits = [];
+
+      let expanded = await adversusGet(`/v1/leads/${id}?expand=resultFields`).catch(() => null);
+      if (!expanded?.ok) expanded = await adversusGet(`/v1/leads/${id}?include=resultFields`).catch(() => null);
+
+      if (expanded?.ok && expanded.body) {
+        const body = expanded.body;
+        const candidates = [
+          body?.resultFields,
+          body?.data?.resultFields,
+          Array.isArray(body?.leads) ? body.leads[0]?.resultFields : undefined,
+          Array.isArray(body?.leads) ? body.leads[0]?.data?.resultFields : undefined,
+        ];
+        for (const c of candidates) {
+          hits.push(...fromDataArray(c), ...fromDataObject(c));
+        }
+      }
+
+      perLead.push({ leadId: id, fields: hits });
+
+      for (const f of hits) {
+        if (f.id != null) {
+          if (!aggById.has(f.id)) aggById.set(f.id, { count: 0, labelSamples: new Set(), example: f.example });
+          const a = aggById.get(f.id);
+          a.count++; if (f.label) a.labelSamples.add(f.label); if (!a.example) a.example = f.example;
+        }
+        if (f.label) {
+          if (!aggByLbl.has(f.label)) aggByLbl.set(f.label, { count: 0, idSamples: new Set(), example: f.example });
+          const a = aggByLbl.get(f.label);
+          a.count++; if (f.id != null) a.idSamples.add(f.id); if (!a.example) a.example = f.example;
+        }
+      }
+
+      await delay(450);
+    }
+
+    const byId = Array.from(aggById.entries()).map(([id, a]) => ({
+      id, labelSamples: Array.from(a.labelSamples).slice(0,3), count: a.count, example: a.example
+    })).sort((x,y) => y.count - x.count || (x.id - y.id));
+
+    const byLabel = Array.from(aggByLbl.entries()).map(([label, a]) => ({
+      label, idSamples: Array.from(a.idSamples).slice(0,3), count: a.count, example: a.example
+    })).sort((x,y) => y.count - x.count || x.label.localeCompare(y.label));
+
+    res.json({ ok: true, scanned: toScan.length, byId, byLabel, sample: perLead.slice(0,3) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
 
 // ==== Start server ====
 app.listen(PORT, () => console.log(`Gavdash API listening on ${PORT}`));
