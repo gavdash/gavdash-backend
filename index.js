@@ -143,14 +143,14 @@ app.get("/adversus/campaigns", requireSecret, async (_req, res) => {
     if (!r.ok) return res.status(r.status || 500).json({ ok: false, status: r.status, url: r.url, error: typeof r.body === "string" ? r.body.slice(0, 2000) : r.body });
     const raw = r.body;
     const totalCount = Array.isArray(raw) ? raw.length : undefined;
-    const data = Array.isArray(raw) ? raw.slice(0, 50) : raw;
-    res.json({ ok: true, url: r.url, total_count: totalCount, returned: Array.isArray(data) ? data.length : undefined, truncated: typeof totalCount === "number" ? totalCount > 50 : undefined, data });
+    const data = Array.isArray(raw) ? raw.slice(0, 200) : raw; // giv lidt mere luft end 50
+    res.json({ ok: true, url: r.url, total_count: totalCount, returned: Array.isArray(data) ? data.length : undefined, truncated: typeof totalCount === "number" ? totalCount > 200 : undefined, data });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-// ==== Leads (normaliseret til flad liste) ====
+// ==== Leads (normaliseret liste) ====
 app.get("/adversus/leads", requireSecret, async (req, res) => {
   try {
     const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
@@ -188,39 +188,22 @@ app.get("/adversus/leads", requireSecret, async (req, res) => {
   }
 });
 
-// ==== NYT: Leads Inspect (find felter + samples) ====
-function flatten(obj, maxDepth = 2, prefix = "", out = {}) {
-  if (!obj || typeof obj !== "object" || maxDepth < 0) return out;
-  if (Array.isArray(obj)) {
-    // hvis array af simple værdier, gem som join; hvis array af objekter, skip dybere
-    const simple = obj.every(v => v == null || ["string","number","boolean"].includes(typeof v));
-    if (simple) { out[prefix || "[]"] = obj.join(", "); return out; }
-    return out; // undgå at eksplodere på dybe arrays af objekter
-  }
-  for (const [k,v] of Object.entries(obj)) {
-    const key = prefix ? `${prefix}.${k}` : k;
-    if (v != null && typeof v === "object" && !Array.isArray(v) && maxDepth > 0) {
-      flatten(v, maxDepth - 1, key, out);
-    } else if (Array.isArray(v)) {
-      // tag første værdi som sample hvis simpel
-      const simple = v.every(x => x == null || ["string","number","boolean"].includes(typeof x));
-      out[key] = simple ? v.join(", ") : `[array(${v.length})]`;
-    } else {
-      out[key] = v;
-    }
-  }
-  return out;
-}
-
-app.get("/adversus/leads/inspect", requireSecret, async (req, res) => {
+// ==== NYT: Leads + kontaktdata (join via contactId) ====
+app.get("/adversus/leads/enriched", requireSecret, async (req, res) => {
   try {
-    // genbrug normaliseringslogikken
+    // 1) hent leads (samme query videre)
     const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
     const r = await adversusGet(`/v1/leads${search}`);
-    if (!r.ok) return res.status(r.status || 500).json({ ok: false, status: r.status, url: r.url, error: typeof r.body === "string" ? r.body.slice(0, 2000) : r.body });
+    if (!r.ok) {
+      return res.status(r.status || 500).json({
+        ok: false, status: r.status, url: r.url,
+        error: typeof r.body === "string" ? r.body.slice(0, 2000) : r.body,
+      });
+    }
 
-    let items = [];
+    // 2) normalisér til liste
     const payload = r.body;
+    let items = [];
     if (Array.isArray(payload)) items = payload;
     else if (payload && typeof payload === "object") {
       for (const k of ["items", "data", "rows", "results", "list", "leads"]) {
@@ -232,21 +215,42 @@ app.get("/adversus/leads/inspect", requireSecret, async (req, res) => {
       }
     }
 
-    // inspicér de første N rows
-    const inspectN = Math.min(items.length, Math.max(1, Math.min(200, parseInt(String(req.query.limit ?? "50"),10))));
-    const counts = {};
-    const samples = {};
-    for (let i = 0; i < inspectN; i++) {
-      const flat = flatten(items[i], 2);
-      for (const [k, v] of Object.entries(flat)) {
-        counts[k] = (counts[k] || 0) + 1;
-        if (!(k in samples)) samples[k] = v;
-      }
-    }
-    const keys = Object.keys(counts).sort((a,b)=> a.localeCompare(b));
-    const stats = keys.map(k => ({ key: k, count: counts[k], pct: counts[k]/inspectN, sample: samples[k] }));
+    // anvend evt. ?limit=
+    const limitQ = parseInt(String(req.query.limit ?? ""), 10);
+    const limit = Number.isFinite(limitQ) && limitQ > 0 ? limitQ : null;
+    if (limit && items.length > limit) items = items.slice(0, limit);
 
-    res.json({ ok: true, url: r.url, inspected: inspectN, stats, sample: items.slice(0, Math.min(2, inspectN)) });
+    // 3) saml unikke contactIds
+    const contactIds = [...new Set(items.map(x => x?.contactId).filter(Boolean))];
+
+    // 4) hent kontakter (små batches)
+    async function fetchContact(id) {
+      const cr = await adversusGet(`/v1/contacts/${id}`);
+      if (!cr.ok) return null;
+      return cr.body;
+    }
+    const contacts = {};
+    const BATCH = 5;
+    for (let i = 0; i < contactIds.length; i += BATCH) {
+      const slice = contactIds.slice(i, i + BATCH);
+      const part = await Promise.all(slice.map(id => fetchContact(id).then(c => [id, c])));
+      for (const [id, c] of part) contacts[id] = c;
+    }
+
+    // 5) join ind på hvert lead
+    const enriched = items.map(lead => {
+      const contact = lead?.contactId ? (contacts[lead.contactId] || null) : null;
+      return { ...lead, contact };
+    });
+
+    const totalCount =
+      (typeof payload?.total === "number" && payload.total) ||
+      (typeof payload?.count === "number" && payload.count) ||
+      (typeof payload?.totalCount === "number" && payload.totalCount) ||
+      (Array.isArray(r.body) ? r.body.length : undefined) ||
+      enriched.length;
+
+    res.json({ ok: true, url: r.url, total_count: totalCount, returned: enriched.length, data: enriched });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
