@@ -329,9 +329,10 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
   }
 });
 
-// ==== Inspect RESULT FIELDS – DEEP (forsøg flere endpoints pr. lead) ====
+// ==== Inspect RESULT (fields + resultData) — deep via expand=results ====
 app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, res) => {
   try {
+    // 1) Hent en liste af leads som base (samme query/filters du allerede bruger)
     const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
     const listResp = await adversusGet(`/v1/leads${search}`);
     if (!listResp.ok) {
@@ -358,6 +359,7 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
     const sample = Math.max(1, Math.min(20, parseInt(String(req.query.sample || "10"),10) || 10));
     const toScan = leads.slice(0, sample);
 
+    // helpers til at aflæse arrays/objekter med (label,value)-par
     function fromDataArray(arr) {
       const out = [];
       if (!Array.isArray(arr)) return out;
@@ -387,7 +389,8 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
       }
       return out;
     }
-    const seen = {};
+
+    const seen = {}; // fx 'resultData.Samlet præmie hos os' -> {count, example}
     const tryLog = [];
 
     function hit(fieldId, val) {
@@ -403,46 +406,47 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
       const id = lead?.id ?? lead?.leadId ?? lead?.leadID;
       if (!id) continue;
 
-      let resultCandidates = [];
-      const p1 = await adversusGet(`/v1/leads/${id}/results`).catch(() => null);
-      if (p1?.ok && Array.isArray(p1.body)) {
-        tryLog.push({ id, endpoint: "leads/{id}/results", count: p1.body.length });
-        resultCandidates = p1.body;
-      }
-
-      if (!resultCandidates.length) {
-        const p2 = await adversusGet(`/v1/results?leadId=${encodeURIComponent(id)}`).catch(() => null);
-        if (p2?.ok && Array.isArray(p2.body)) {
-          tryLog.push({ id, endpoint: "results?leadId", count: p2.body.length });
-          resultCandidates = p2.body;
-        }
-      }
-
-      if (!resultCandidates.length) {
-        const p3 = await adversusGet(`/v1/leads/${id}?expand=results`).catch(() => null);
-        const p3b = (!p3?.ok) ? await adversusGet(`/v1/leads/${id}?include=results`).catch(() => null) : null;
-        const src = p3?.ok ? p3 : p3b;
-        const srcName = p3?.ok ? "leads/{id}?expand=results" : (p3b?.ok ? "leads/{id}?include=results" : null);
-        if (src?.ok && src?.body && typeof src.body === "object") {
-          const arr = Array.isArray(src.body.results) ? src.body.results : Array.isArray(src.body?.data?.results) ? src.body.data.results : null;
-          if (arr) {
-            tryLog.push({ id, endpoint: srcName, count: arr.length });
-            resultCandidates = arr;
+      // Brug expand=results (det var her din probe fandt data)
+      const p = await adversusGet(`/v1/leads/${id}?expand=results`).catch(() => null);
+      if (p?.ok && p.body && typeof p.body === "object") {
+        // resultater kan ligge i body.results eller body.leads[0].resultData (som din shape_probe viste)
+        let results = Array.isArray(p.body?.results) ? p.body.results : null;
+        if (!results && Array.isArray(p.body?.leads)) {
+          // nogle svar former: { leads: [ { ..., results: [...] } ] }
+          const first = p.body.leads[0];
+          if (first && Array.isArray(first.results)) results = first.results;
+          // din probe viste "lead_expand_results.leads.[0].resultData" – så tjek også direkte resultData på lead
+          if (!results && (first?.resultData || first?.resultFields)) {
+            // fake et “resultat” objekt så vi kan reuse scanning
+            results = [{ resultData: first.resultData, resultFields: first.resultFields }];
           }
         }
-      }
 
-      if (Array.isArray(resultCandidates) && resultCandidates.length) {
-        resultCandidates.sort((a,b) => new Date(b?.created||b?.updated||0) - new Date(a?.created||a?.updated||0));
-        const latest = resultCandidates[0];
-        const places = [ latest?.resultFields, latest?.fields ];
-        for (const p of places) {
-          fromDataArray(p).forEach(({label,value}) => hit(`resultFields.${label}`, value));
-          fromDataObject(p).forEach(({label,value}) => hit(`resultFields.${label}`, value));
+        if (Array.isArray(results) && results.length) {
+          // vælg seneste
+          results.sort((a,b) => new Date(b?.created||b?.updated||0) - new Date(a?.created||a?.updated||0));
+          const latest = results[0];
+
+          // SCAN: både resultFields og resultData (array + objekt)
+          const places = [
+            latest?.resultFields, latest?.fields,       // nogle konti
+            latest?.resultData,  latest?.data?.resultData // hos jer
+          ];
+          for (const p of places) {
+            fromDataArray(p).forEach(({label,value}) => hit(`resultData.${label}`, value));
+            fromDataObject(p).forEach(({label,value}) => hit(`resultData.${label}`, value));
+          }
+
+          tryLog.push({ id, endpoint: "leads/{id}?expand=results", got: true });
+        } else {
+          tryLog.push({ id, endpoint: "leads/{id}?expand=results", got: false });
         }
+      } else {
+        tryLog.push({ id, endpoint: "leads/{id}?expand=results", got: false });
       }
 
-      await delay(900); // ~60/min, langt under burst limit
+      // throttle (rolig trafik: ~60/min)
+      await delay(800);
     }
 
     const fields = Object.entries(seen)
@@ -461,86 +465,6 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
   }
 });
 
-// ==== NYT: SHAPE PROBE (PII-safe – returnerer kun paths/keys) ====
-app.get("/adversus/leads/shape_probe", requireSecret, async (req, res) => {
-  try {
-    const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
-    const listResp = await adversusGet(`/v1/leads${search}`);
-    if (!listResp.ok) {
-      return res.status(listResp.status || 500).json({
-        ok: false, status: listResp.status, url: listResp.url,
-        error: typeof listResp.body === "string" ? listResp.body.slice(0,2000) : listResp.body
-      });
-    }
-
-    const payload = listResp.body;
-    let leads = [];
-    if (Array.isArray(payload)) leads = payload;
-    else if (payload && typeof payload === "object") {
-      for (const k of ["items","data","rows","results","list","leads"]) {
-        if (Array.isArray(payload[k])) { leads = payload[k]; break; }
-      }
-      if (!leads.length) {
-        const firstArrayKey = Object.keys(payload).find(k => Array.isArray(payload[k]));
-        if (firstArrayKey) leads = payload[firstArrayKey];
-      }
-    }
-
-    const sample = Math.max(1, Math.min(5, parseInt(String(req.query.sample || "3"),10) || 3));
-    const toScan = leads.slice(0, sample);
-
-    // rekursiv key-walk — SAMLER KUN PATHS (ingen værdier)
-    const maxDepth = 6;
-    const interesting = new Set();
-    function walk(obj, path = [], depth = 0) {
-      if (!obj || typeof obj !== "object" || depth >= maxDepth) return;
-      const keys = Array.isArray(obj) ? Object.keys(obj) : Object.keys(obj);
-      for (const k of keys) {
-        const next = Array.isArray(obj) ? obj[Number(k)] : obj[k];
-        const p = [...path, Array.isArray(obj) ? `[${k}]` : k];
-        const ps = p.join(".");
-        // marker interessante stier
-        if (/(result|results|disposition|fields)/i.test(k)) interesting.add(ps);
-        if (next && typeof next === "object") walk(next, p, depth + 1);
-      }
-    }
-
-    const diag = [];
-    const delay = (ms) => new Promise(r => setTimeout(r, ms));
-
-    for (const lead of toScan) {
-      walk(lead, ["lead"]);
-      const id = lead?.id ?? lead?.leadId ?? lead?.leadID;
-      if (!id) continue;
-
-      const p1 = await adversusGet(`/v1/leads/${id}/results`).catch(() => null);
-      if (p1?.ok) { walk(p1.body, ["leads_id_results"]); diag.push({ id, endpoint: "leads/{id}/results", ok: true }); }
-
-      const p2 = await adversusGet(`/v1/results?leadId=${encodeURIComponent(id)}`).catch(() => null);
-      if (p2?.ok) { walk(p2.body, ["results_q_leadId"]); diag.push({ id, endpoint: "results?leadId", ok: true }); }
-
-      const p3 = await adversusGet(`/v1/leads/${id}?expand=results`).catch(() => null);
-      if (p3?.ok) { walk(p3.body, ["lead_expand_results"]); diag.push({ id, endpoint: "leads/{id}?expand=results", ok: true }); }
-
-      if (!p3?.ok) {
-        const p3b = await adversusGet(`/v1/leads/${id}?include=results`).catch(() => null);
-        if (p3b?.ok) { walk(p3b.body, ["lead_include_results"]); diag.push({ id, endpoint: "leads/{id}?include=results", ok: true }); }
-      }
-
-      await delay(600);
-    }
-
-    res.json({
-      ok: true,
-      total_returned: leads.length,
-      scanned: toScan.length,
-      interesting_paths: Array.from(interesting).sort(),
-      diag
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
 
 // ==== Start server ====
 app.listen(PORT, () => console.log(`Gavdash API listening on ${PORT}`));
