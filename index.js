@@ -391,7 +391,6 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
       }
       if (structured) return out;
 
-      // fallback: { "96830": "1234 kr" }
       for (const [k,v] of Object.entries(obj)) {
         if (/^\d+$/.test(k)) {
           const id = Number(k);
@@ -486,6 +485,100 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
   }
 });
 
+// ==== NY: scan efter NUMERISKE nøgler i resultData (fx 96830) ====
+app.get("/adversus/leads/resultdata_ids_preview", requireSecret, async (req, res) => {
+  try {
+    const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
+    const listResp = await adversusGet(`/v1/leads${search}`);
+    if (!listResp.ok) {
+      return res.status(listResp.status || 500).json({
+        ok: false, status: listResp.status, url: listResp.url,
+        error: typeof listResp.body === "string" ? listResp.body.slice(0,2000) : listResp.body
+      });
+    }
+
+    // normaliser
+    const payload = listResp.body;
+    let leads = [];
+    if (Array.isArray(payload)) leads = payload;
+    else if (payload && typeof payload === "object") {
+      for (const k of ["items","data","rows","results","list","leads"]) {
+        if (Array.isArray(payload[k])) { leads = payload[k]; break; }
+      }
+      if (!leads.length) {
+        const firstArrayKey = Object.keys(payload).find(k => Array.isArray(payload[k]));
+        if (firstArrayKey) leads = payload[firstArrayKey];
+      }
+    }
+
+    const sample = Math.max(1, Math.min(15, parseInt(String(req.query.sample || "10"),10) || 10));
+    const toScan = leads.slice(0, sample);
+
+    function collectNumericKeys(obj) {
+      const out = [];
+      if (!obj || typeof obj !== "object") return out;
+      for (const [k,v] of Object.entries(obj)) {
+        if (/^\d+$/.test(k)) {
+          const id = Number(k);
+          if (v != null && String(v).trim?.() !== "") out.push({ id, example: v });
+        }
+      }
+      return out;
+    }
+
+    const seen = new Map(); // id -> {count, example}
+    const perLead = [];
+    const delay = (ms) => new Promise(r => setTimeout(r, ms));
+
+    for (const lead of toScan) {
+      const id = lead?.id ?? lead?.leadId ?? lead?.leadID;
+      if (!id) continue;
+      const hits = [];
+
+      // A) resultData direkte på lead (expand/include=results for at få “resultData” som nogle konti har på leadet)
+      const pA = await adversusGet(`/v1/leads/${id}?expand=results`).catch(() => null);
+      if (pA?.ok && pA.body) {
+        const b = pA.body;
+        const candidates = [
+          b?.resultData, b?.data?.resultData,
+          Array.isArray(b?.leads) ? b.leads[0]?.resultData : undefined,
+          Array.isArray(b?.leads) ? b.leads[0]?.data?.resultData : undefined
+        ];
+        for (const c of candidates) hits.push(...collectNumericKeys(c));
+
+        // B) seneste resultater
+        let results = Array.isArray(b?.results) ? b.results : null;
+        if (!results && Array.isArray(b?.leads)) {
+          const first = b.leads[0];
+          if (first && Array.isArray(first.results)) results = first.results;
+        }
+        if (Array.isArray(results) && results.length) {
+          results.sort((a,x) => new Date(x?.created||x?.updated||0) - new Date(a?.created||a?.updated||0));
+          const latest = results[0];
+          hits.push(...collectNumericKeys(latest?.resultData), ...collectNumericKeys(latest?.data?.resultData));
+        }
+      }
+
+      perLead.push({ leadId: id, ids: hits });
+
+      for (const h of hits) {
+        if (!seen.has(h.id)) seen.set(h.id, { count: 0, example: h.example });
+        const a = seen.get(h.id);
+        a.count++;
+        if (!a.example) a.example = h.example;
+      }
+      await delay(400);
+    }
+
+    const ids = Array.from(seen.entries()).map(([id,a]) => ({ id, count: a.count, example: a.example }))
+      .sort((x,y) => y.count - x.count || (x.id - y.id));
+
+    res.json({ ok:true, scanned: toScan.length, ids, sample: perLead.slice(0,3) });
+  } catch (e) {
+    res.status(500).json({ ok:false, error: String(e.message || e) });
+  }
+});
+
 // ---- PREVIEW: resultFields pr. lead (label + id + eksempel) ----
 app.get("/adversus/leads/resultfields_preview", requireSecret, async (req, res) => {
   try {
@@ -494,11 +587,10 @@ app.get("/adversus/leads/resultfields_preview", requireSecret, async (req, res) 
     if (!listResp.ok) {
       return res.status(listResp.status || 500).json({
         ok: false, status: listResp.status, url: listResp.url,
-        error: typeof listResp.body === "string" ? r.body.slice(0,2000) : listResp.body
+        error: typeof listResp.body === "string" ? listResp.body.slice(0,2000) : listResp.body
       });
     }
 
-    // normaliser lead-liste
     const payload = listResp.body;
     let leads = [];
     if (Array.isArray(payload)) leads = payload;
@@ -533,7 +625,6 @@ app.get("/adversus/leads/resultfields_preview", requireSecret, async (req, res) 
     function fromDataObject(obj) {
       const out = [];
       if (!obj || typeof obj !== "object" || Array.isArray(obj)) return out;
-
       let pushed = false;
       for (const [k,v] of Object.entries(obj)) {
         if (v && typeof v === "object" && !Array.isArray(v)) {
@@ -547,8 +638,6 @@ app.get("/adversus/leads/resultfields_preview", requireSecret, async (req, res) 
         }
       }
       if (pushed) return out;
-
-      // fallback: { "96830": "1234 kr" }
       for (const [k,v] of Object.entries(obj)) {
         if (/^\d+$/.test(k)) {
           const id = Number(k);
