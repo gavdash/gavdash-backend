@@ -485,7 +485,7 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
   }
 });
 
-// ==== Scan NUMERISKE nøgler i resultData (fx 96830) – over ALLE resultater, med "success"-filter ====
+// ==== Scan NUMERISKE nøgler i resultData/fields (fx 96830) – ALLE resultater + flere kilder ====
 app.get("/adversus/leads/resultdata_ids_preview", requireSecret, async (req, res) => {
   try {
     const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
@@ -514,11 +514,11 @@ app.get("/adversus/leads/resultdata_ids_preview", requireSecret, async (req, res
     const sample = Math.max(1, Math.min(30, parseInt(String(req.query.sample || "15"),10) || 15));
     const toScan = leads.slice(0, sample);
 
-    // Valgfrit filter: kræv "success"-resultater
-    const requireSuccess = String(req.query.requireSuccess || "true").toLowerCase() === "true";
+    // success-filter (kan slåes fra med requireSuccess=false)
+    const requireSuccess = String(req.query.requireSuccess ?? "true").toLowerCase() === "true";
     const successWords = new Set(["success","successful","won","sale","solgt","succes","ok","completed"]);
 
-    // Hjælpere til at læse værdier/labels
+    // helpers til values/labels
     function coerceExample(val) {
       if (val == null) return null;
       if (Array.isArray(val)) return val.filter(x => x != null).map(String).join(", ");
@@ -537,36 +537,31 @@ app.get("/adversus/leads/resultdata_ids_preview", requireSecret, async (req, res
       }
       return fallbackKey != null ? String(fallbackKey) : null;
     }
-
-    // Tjek om et result-objekt er "success"
     function isSuccessResult(r) {
       if (!requireSuccess) return true;
-      // fleksible feltnavne – vi ved ikke præcis hvordan jeres konto returnerer det
-      const candidates = [
+      const cand = [
         r?.status, r?.result, r?.outcome, r?.type, r?.disposition, r?.dispositionName,
         r?.data?.status, r?.data?.result, r?.data?.outcome, r?.data?.type, r?.data?.disposition, r?.data?.dispositionName,
         typeof r?.success === "boolean" ? (r.success ? "success" : "") : null
       ].filter(Boolean).map(s => String(s).toLowerCase());
-
-      if (!candidates.length) return false;
-      return candidates.some(s => successWords.has(s));
+      if (!cand.length) return false;
+      return cand.some(s => successWords.has(s));
     }
-
-    // Saml numeriske entries (fx {"96830": {...}})
-    function collectNumericEntries(obj) {
+    function collectNumericEntries(obj, prefixLabel) {
       const out = [];
       if (!obj || typeof obj !== "object") return out;
       for (const [k, v] of Object.entries(obj)) {
-        if (!/^\d+$/.test(k)) continue;
+        if (!/^\d+$/.test(k)) continue;                 // kun numeriske keys (fx "96830")
         const numId = Number(k);
         const example = coerceExample(v);
         const label = extractLabel(v, k);
         if (example != null && String(example).trim() !== "") {
-          out.push({ id: numId, label, example });
+          out.push({ id: numId, label, example, source: prefixLabel || "" });
         }
       }
       return out;
     }
+    function arrayify(x) { return Array.isArray(x) ? x : (x != null ? [x] : []); }
 
     const seen = new Map(); // id -> { count, labelSamples:Set, example }
     const perLead = [];
@@ -576,48 +571,91 @@ app.get("/adversus/leads/resultdata_ids_preview", requireSecret, async (req, res
     for (const lead of toScan) {
       const leadId = lead?.id ?? lead?.leadId ?? lead?.leadID;
       if (!leadId) continue;
+
       const hits = [];
+      const d = { leadId, tried: [] };
 
-      // Hent ALLE resultater via expand=results
-      const p = await adversusGet(`/v1/leads/${leadId}?expand=results`).catch(() => null);
-      if (p?.ok && p.body) {
-        let results = Array.isArray(p.body?.results) ? p.body.results : null;
-        if (!results && Array.isArray(p.body?.leads)) {
-          const first = p.body.leads[0];
-          if (first && Array.isArray(first.results)) results = first.results;
-        }
-
-        if (Array.isArray(results) && results.length) {
-          // gennemgå ALLE resultater, og filtrér evt. til "success"
-          for (const r of results) {
-            if (!isSuccessResult(r)) continue;
-
-            // scan resultData for numeriske keys
-            hits.push(
-              ...collectNumericEntries(r?.resultData),
-              ...collectNumericEntries(r?.data?.resultData)
-            );
-
-            // (ekstra: nogle konti gemmer samme tal som strings direkte på leadets resultData)
-            // det tjekker vi via expand=results ovenfor, men lead-level kan også have dem:
-            const leadLevel = [
-              p.body?.resultData, p.body?.data?.resultData,
-              Array.isArray(p.body?.leads) ? p.body.leads[0]?.resultData : undefined,
-              Array.isArray(p.body?.leads) ? p.body.leads[0]?.data?.resultData : undefined
-            ];
-            for (const c of leadLevel) hits.push(...collectNumericEntries(c));
-          }
-          diag.push({ leadId, results: results.length, successFiltered: requireSuccess });
-        } else {
-          diag.push({ leadId, results: 0 });
+      // --- Source A: /leads/{id}/results
+      let srcA = await adversusGet(`/v1/leads/${leadId}/results`).catch(() => null);
+      if (srcA?.ok) {
+        const listA = Array.isArray(srcA.body) ? srcA.body : [];
+        d.tried.push({ endpoint: "leads/{id}/results", count: listA.length });
+        for (const r of listA) {
+          if (!isSuccessResult(r)) continue;
+          hits.push(
+            ...collectNumericEntries(r?.resultData, "A.resultData"),
+            ...collectNumericEntries(r?.data?.resultData, "A.data.resultData"),
+            ...collectNumericEntries(r?.fields, "A.fields"),
+            ...collectNumericEntries(r?.resultFields, "A.resultFields"),
+            ...collectNumericEntries(r?.data?.fields, "A.data.fields")
+          );
         }
       } else {
-        diag.push({ leadId, err: true });
+        d.tried.push({ endpoint: "leads/{id}/results", error: true });
       }
 
-      perLead.push({ leadId, ids: hits });
+      // --- Source B: /results?leadId=
+      if (hits.length === 0) {
+        let srcB = await adversusGet(`/v1/results?leadId=${encodeURIComponent(leadId)}`).catch(() => null);
+        if (srcB?.ok) {
+          const listB = Array.isArray(srcB.body) ? srcB.body : [];
+          d.tried.push({ endpoint: "results?leadId", count: listB.length });
+          for (const r of listB) {
+            if (!isSuccessResult(r)) continue;
+            hits.push(
+              ...collectNumericEntries(r?.resultData, "B.resultData"),
+              ...collectNumericEntries(r?.data?.resultData, "B.data.resultData"),
+              ...collectNumericEntries(r?.fields, "B.fields"),
+              ...collectNumericEntries(r?.resultFields, "B.resultFields"),
+              ...collectNumericEntries(r?.data?.fields, "B.data.fields")
+            );
+          }
+        } else {
+          d.tried.push({ endpoint: "results?leadId", error: true });
+        }
+      }
 
-      // Aggreger pr. id
+      // --- Source C: leads/{id}?expand=results (og include=results)
+      if (hits.length === 0) {
+        let srcC = await adversusGet(`/v1/leads/${leadId}?expand=results`).catch(() => null);
+        if (!srcC?.ok) srcC = await adversusGet(`/v1/leads/${leadId}?include=results`).catch(() => null);
+        if (srcC?.ok && srcC.body) {
+          const b = srcC.body;
+          // Broad finder for en results-array forskellige steder:
+          const candidateArrays = []
+            .concat(arrayify(b?.results))
+            .concat(arrayify(b?.data?.results))
+            .concat(Array.isArray(b?.leads) ? arrayify(b.leads[0]?.results) : [])
+            .concat(Array.isArray(b?.items) ? arrayify(b.items[0]?.results) : []);
+
+          const flat = candidateArrays.flat().filter(Boolean);
+          d.tried.push({ endpoint: "leads/{id}?expand/include=results", count: flat.length });
+
+          for (const r of flat) {
+            if (!isSuccessResult(r)) continue;
+            hits.push(
+              ...collectNumericEntries(r?.resultData, "C.resultData"),
+              ...collectNumericEntries(r?.data?.resultData, "C.data.resultData"),
+              ...collectNumericEntries(r?.fields, "C.fields"),
+              ...collectNumericEntries(r?.resultFields, "C.resultFields"),
+              ...collectNumericEntries(r?.data?.fields, "C.data.fields")
+            );
+          }
+
+          // Nogle konti lægger også resultData direkte på lead (ikke kun i results[]):
+          const leadLevelRD = [
+            b?.resultData, b?.data?.resultData,
+            Array.isArray(b?.leads) ? b.leads[0]?.resultData : undefined,
+            Array.isArray(b?.leads) ? b.leads[0]?.data?.resultData : undefined
+          ];
+          for (const c of leadLevelRD) hits.push(...collectNumericEntries(c, "C.lead.resultData"));
+        } else {
+          d.tried.push({ endpoint: "leads/{id}?expand/include=results", error: true });
+        }
+      }
+
+      // Aggreger
+      perLead.push({ leadId, ids: hits });
       for (const h of hits) {
         if (!seen.has(h.id)) seen.set(h.id, { count: 0, labelSamples: new Set(), example: h.example });
         const a = seen.get(h.id);
@@ -626,7 +664,8 @@ app.get("/adversus/leads/resultdata_ids_preview", requireSecret, async (req, res
         if (!a.example) a.example = h.example;
       }
 
-      await delay(300);
+      diag.push(d);
+      await delay(250); // rolig trafik
     }
 
     const ids = Array.from(seen.entries()).map(([id, a]) => ({
@@ -641,7 +680,6 @@ app.get("/adversus/leads/resultdata_ids_preview", requireSecret, async (req, res
     res.status(500).json({ ok:false, error: String(e.message || e) });
   }
 });
-
 
 // ==== Start server ====
 app.listen(PORT, () => console.log(`Gavdash API listening on ${PORT}`));
