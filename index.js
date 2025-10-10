@@ -198,7 +198,7 @@ app.get("/adversus/leads", requireSecret, async (req, res) => {
   }
 });
 
-// ==== Inspect NON-PII felter (forbedret: arrays ELLER objekter, + deep) ====
+// ==== Inspect NON-PII felter (nu også resultFields) ====
 app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
   try {
     const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
@@ -224,7 +224,6 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
       }
     }
 
-    // hvilke direkte felter (non-PII) vi måler
     const DIRECT_KEYS = [
       "id","campaignId","created","updated","importedTime",
       "lastUpdatedTime","lastModifiedTime","nextContactTime",
@@ -237,7 +236,6 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
       if (!Array.isArray(arr)) return out;
       for (const it of arr) {
         const label = String(it?.label ?? it?.name ?? it?.title ?? it?.key ?? "").trim();
-        // værdi kan hedde meget – tag første bedste
         const value =
           it?.value ?? it?.val ?? it?.data ?? it?.text ?? it?.content ??
           (Array.isArray(it?.values) ? it.values.join(", ") : null);
@@ -247,7 +245,6 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
       }
       return out;
     }
-    // NYT: hvis masterData/resultData er et OBJEKT i stedet for en array
     function fromDataObject(obj) {
       const out = [];
       if (!obj || typeof obj !== "object" || Array.isArray(obj)) return out;
@@ -255,7 +252,6 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
         const label = String(k).trim();
         let value = v;
         if (value && typeof value === "object") {
-          // almindelige former: { value: "x" } eller { text: ... } eller { values: [...] }
           value = value.value ?? value.val ?? value.text ?? (Array.isArray(value.values) ? value.values.join(", ") : undefined);
         }
         if (!label) continue;
@@ -265,7 +261,7 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
       return out;
     }
 
-    const seen = {}; // { fieldId: { count, example } }
+    const seen = {}; // fieldId -> {count, example}
     function hit(fieldId, val) {
       if (val === undefined || val === null || (typeof val.trim === "function" && val.trim() === "")) return;
       if (!seen[fieldId]) seen[fieldId] = { count: 0, example: val };
@@ -277,29 +273,32 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
       // direkte felter
       DIRECT_KEYS.forEach(k => hit(k, row?.[k]));
 
-      // masterData/resultData – både array OG objekt, plus deep fallback hvis nogen har lagt under f.eks. row.data.masterData
-      const mdArr = fromDataArray(row?.masterData) || [];
-      mdArr.forEach(({label, value}) => hit(`masterData.${label}`, value));
+      // master/result arrays/objekter
+      fromDataArray(row?.masterData).forEach(({label,value}) => hit(`masterData.${label}`, value));
+      fromDataArray(row?.resultData).forEach(({label,value}) => hit(`resultData.${label}`, value));
+      fromDataObject(row?.masterData).forEach(({label,value}) => hit(`masterData.${label}`, value));
+      fromDataObject(row?.resultData).forEach(({label,value}) => hit(`resultData.${label}`, value));
 
-      const rdArr = fromDataArray(row?.resultData) || [];
-      rdArr.forEach(({label, value}) => hit(`resultData.${label}`, value));
+      // deep under data.*
+      fromDataArray(row?.data?.masterData).forEach(({label,value}) => hit(`masterData.${label}`, value));
+      fromDataArray(row?.data?.resultData).forEach(({label,value}) => hit(`resultData.${label}`, value));
+      fromDataObject(row?.data?.masterData).forEach(({label,value}) => hit(`masterData.${label}`, value));
+      fromDataObject(row?.data?.resultData).forEach(({label,value}) => hit(`resultData.${label}`, value));
 
-      const mdObj = fromDataObject(row?.masterData) || [];
-      mdObj.forEach(({label, value}) => hit(`masterData.${label}`, value));
-
-      const rdObj = fromDataObject(row?.resultData) || [];
-      rdObj.forEach(({label, value}) => hit(`resultData.${label}`, value));
-
-      // faldbak: hvis nogle lægger under row.data.masterData / row.data.resultData
-      const deepMDarr = fromDataArray(row?.data?.masterData) || [];
-      deepMDarr.forEach(({label, value}) => hit(`masterData.${label}`, value));
-      const deepRDarr = fromDataArray(row?.data?.resultData) || [];
-      deepRDarr.forEach(({label, value}) => hit(`resultData.${label}`, value));
-
-      const deepMDobj = fromDataObject(row?.data?.masterData) || [];
-      deepMDobj.forEach(({label, value}) => hit(`masterData.${label}`, value));
-      const deepRDobj = fromDataObject(row?.data?.resultData) || [];
-      deepRDobj.forEach(({label, value}) => hit(`resultData.${label}`, value));
+      // >>> NYT: resultFields (array OG objekt) + almindelige “last result” placeringer
+      const rfPlaces = [
+        row?.resultFields,
+        row?.data?.resultFields,
+        row?.lastResult?.resultFields,
+        row?.lastCall?.resultFields,
+        row?.callResult?.resultFields,
+        row?.result?.fields,          // nogle modeller
+        row?.lastResult?.fields,
+      ];
+      rfPlaces.forEach(p => {
+        fromDataArray(p).forEach(({label,value}) => hit(`resultFields.${label}`, value));
+        fromDataObject(p).forEach(({label,value}) => hit(`resultFields.${label}`, value));
+      });
     });
 
     const total = rows.length || 1;
