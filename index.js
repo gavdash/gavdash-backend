@@ -1,4 +1,4 @@
-// ==== Gavdash Backend (Adversus webhook + DB + API) ====
+// ==== Gavdash Backend (Adversus webhook + DB + API + probes) ====
 // Node 18+ (Render), Express 4
 
 import express from "express";
@@ -119,26 +119,21 @@ app.get("/_debug/events/db", requireSecret, async (_req, res) => {
 // ==== Webhook ====
 app.post("/webhook/adversus", requireSecret, async (req, res) => {
   const payload = req.body || {};
-  theHook(payload);
+  const eventType = payload?.event || payload?.type || null;
 
-  async function theHook(payload) {
-    const eventType = payload?.event || payload?.type || null;
+  lastEvents.unshift({ receivedAt: new Date().toISOString(), eventType, payload });
+  if (lastEvents.length > MAX_EVENTS) lastEvents.pop();
 
-    lastEvents.unshift({ receivedAt: new Date().toISOString(), eventType, payload });
-    if (lastEvents.length > MAX_EVENTS) lastEvents.pop();
-
-    if (pgPool) {
-      try {
-        await pgPool.query("INSERT INTO adversus_events (event_type, payload) VALUES ($1, $2)", [
-          eventType,
-          payload,
-        ]);
-      } catch (e) {
-        console.error("DB insert failed:", e);
-      }
+  if (pgPool) {
+    try {
+      await pgPool.query("INSERT INTO adversus_events (event_type, payload) VALUES ($1, $2)", [
+        eventType,
+        payload,
+      ]);
+    } catch (e) {
+      console.error("DB insert failed:", e);
     }
   }
-
   return res.status(200).json({ ok: true });
 });
 
@@ -146,7 +141,7 @@ app.post("/webhook/adversus", requireSecret, async (req, res) => {
 async function adversusGet(pathWithQuery) {
   const url = `${ADVERSUS_BASE_URL}${pathWithQuery}`;
   const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), 15000);
+  const t = setTimeout(() => controller.abort(), 20000);
   const r = await fetch(url, {
     headers: { Authorization: adversusAuthHeader(), Accept: "application/json" },
     signal: controller.signal,
@@ -334,7 +329,7 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
   }
 });
 
-// ==== Inspect RESULT FIELDS – DEEP (hent seneste result pr. lead) ====
+// ==== Inspect RESULT FIELDS – DEEP (forsøg flere endpoints pr. lead) ====
 app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, res) => {
   try {
     const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
@@ -363,7 +358,6 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
     const sample = Math.max(1, Math.min(20, parseInt(String(req.query.sample || "10"),10) || 10));
     const toScan = leads.slice(0, sample);
 
-    // helpers
     function fromDataArray(arr) {
       const out = [];
       if (!Array.isArray(arr)) return out;
@@ -394,7 +388,7 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
       return out;
     }
     const seen = {};
-    const tryLog = []; // diag: hvilke endpoints gav data
+    const tryLog = [];
 
     function hit(fieldId, val) {
       if (val == null || (typeof val === "string" && val.trim() === "")) return;
@@ -405,20 +399,17 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
 
     const delay = (ms) => new Promise(r => setTimeout(r, ms));
 
-    // For hver lead: prøv et par sandsynlige endpoints for seneste resultat
     for (const lead of toScan) {
       const id = lead?.id ?? lead?.leadId ?? lead?.leadID;
       if (!id) continue;
 
       let resultCandidates = [];
-      // 1) typisk: /v1/leads/{id}/results
       const p1 = await adversusGet(`/v1/leads/${id}/results`).catch(() => null);
       if (p1?.ok && Array.isArray(p1.body)) {
         tryLog.push({ id, endpoint: "leads/{id}/results", count: p1.body.length });
         resultCandidates = p1.body;
       }
 
-      // 2) fallback: /v1/results?leadId={id}
       if (!resultCandidates.length) {
         const p2 = await adversusGet(`/v1/results?leadId=${encodeURIComponent(id)}`).catch(() => null);
         if (p2?.ok && Array.isArray(p2.body)) {
@@ -427,7 +418,6 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
         }
       }
 
-      // 3) fallback: /v1/leads/{id}?expand=results (eller include)
       if (!resultCandidates.length) {
         const p3 = await adversusGet(`/v1/leads/${id}?expand=results`).catch(() => null);
         const p3b = (!p3?.ok) ? await adversusGet(`/v1/leads/${id}?include=results`).catch(() => null) : null;
@@ -442,24 +432,17 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
         }
       }
 
-      // vælg "seneste" – hvis der er created/updated, sorter; ellers brug første
       if (Array.isArray(resultCandidates) && resultCandidates.length) {
         resultCandidates.sort((a,b) => new Date(b?.created||b?.updated||0) - new Date(a?.created||a?.updated||0));
         const latest = resultCandidates[0];
-
-        // felter kan hedde resultFields eller fields
-        const places = [
-          latest?.resultFields,
-          latest?.fields
-        ];
+        const places = [ latest?.resultFields, latest?.fields ];
         for (const p of places) {
           fromDataArray(p).forEach(({label,value}) => hit(`resultFields.${label}`, value));
           fromDataObject(p).forEach(({label,value}) => hit(`resultFields.${label}`, value));
         }
       }
 
-      // throttle (ca. 60/ min) – vi scanner kun få leads
-      await delay(900);
+      await delay(900); // ~60/min, langt under burst limit
     }
 
     const fields = Object.entries(seen)
@@ -472,6 +455,87 @@ app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, 
       scanned: toScan.length,
       fields,
       diag: tryLog
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// ==== NYT: SHAPE PROBE (PII-safe – returnerer kun paths/keys) ====
+app.get("/adversus/leads/shape_probe", requireSecret, async (req, res) => {
+  try {
+    const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
+    const listResp = await adversusGet(`/v1/leads${search}`);
+    if (!listResp.ok) {
+      return res.status(listResp.status || 500).json({
+        ok: false, status: listResp.status, url: listResp.url,
+        error: typeof listResp.body === "string" ? listResp.body.slice(0,2000) : listResp.body
+      });
+    }
+
+    const payload = listResp.body;
+    let leads = [];
+    if (Array.isArray(payload)) leads = payload;
+    else if (payload && typeof payload === "object") {
+      for (const k of ["items","data","rows","results","list","leads"]) {
+        if (Array.isArray(payload[k])) { leads = payload[k]; break; }
+      }
+      if (!leads.length) {
+        const firstArrayKey = Object.keys(payload).find(k => Array.isArray(payload[k]));
+        if (firstArrayKey) leads = payload[firstArrayKey];
+      }
+    }
+
+    const sample = Math.max(1, Math.min(5, parseInt(String(req.query.sample || "3"),10) || 3));
+    const toScan = leads.slice(0, sample);
+
+    // rekursiv key-walk — SAMLER KUN PATHS (ingen værdier)
+    const maxDepth = 6;
+    const interesting = new Set();
+    function walk(obj, path = [], depth = 0) {
+      if (!obj || typeof obj !== "object" || depth >= maxDepth) return;
+      const keys = Array.isArray(obj) ? Object.keys(obj) : Object.keys(obj);
+      for (const k of keys) {
+        const next = Array.isArray(obj) ? obj[Number(k)] : obj[k];
+        const p = [...path, Array.isArray(obj) ? `[${k}]` : k];
+        const ps = p.join(".");
+        // marker interessante stier
+        if (/(result|results|disposition|fields)/i.test(k)) interesting.add(ps);
+        if (next && typeof next === "object") walk(next, p, depth + 1);
+      }
+    }
+
+    const diag = [];
+    const delay = (ms) => new Promise(r => setTimeout(r, ms));
+
+    for (const lead of toScan) {
+      walk(lead, ["lead"]);
+      const id = lead?.id ?? lead?.leadId ?? lead?.leadID;
+      if (!id) continue;
+
+      const p1 = await adversusGet(`/v1/leads/${id}/results`).catch(() => null);
+      if (p1?.ok) { walk(p1.body, ["leads_id_results"]); diag.push({ id, endpoint: "leads/{id}/results", ok: true }); }
+
+      const p2 = await adversusGet(`/v1/results?leadId=${encodeURIComponent(id)}`).catch(() => null);
+      if (p2?.ok) { walk(p2.body, ["results_q_leadId"]); diag.push({ id, endpoint: "results?leadId", ok: true }); }
+
+      const p3 = await adversusGet(`/v1/leads/${id}?expand=results`).catch(() => null);
+      if (p3?.ok) { walk(p3.body, ["lead_expand_results"]); diag.push({ id, endpoint: "leads/{id}?expand=results", ok: true }); }
+
+      if (!p3?.ok) {
+        const p3b = await adversusGet(`/v1/leads/${id}?include=results`).catch(() => null);
+        if (p3b?.ok) { walk(p3b.body, ["lead_include_results"]); diag.push({ id, endpoint: "leads/{id}?include=results", ok: true }); }
+      }
+
+      await delay(600);
+    }
+
+    res.json({
+      ok: true,
+      total_returned: leads.length,
+      scanned: toScan.length,
+      interesting_paths: Array.from(interesting).sort(),
+      diag
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
