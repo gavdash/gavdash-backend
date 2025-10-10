@@ -119,21 +119,26 @@ app.get("/_debug/events/db", requireSecret, async (_req, res) => {
 // ==== Webhook ====
 app.post("/webhook/adversus", requireSecret, async (req, res) => {
   const payload = req.body || {};
-  const eventType = payload?.event || payload?.type || null;
+  theHook(payload);
 
-  lastEvents.unshift({ receivedAt: new Date().toISOString(), eventType, payload });
-  if (lastEvents.length > MAX_EVENTS) lastEvents.pop();
+  async function theHook(payload) {
+    const eventType = payload?.event || payload?.type || null;
 
-  if (pgPool) {
-    try {
-      await pgPool.query("INSERT INTO adversus_events (event_type, payload) VALUES ($1, $2)", [
-        eventType,
-        payload,
-      ]);
-    } catch (e) {
-      console.error("DB insert failed:", e);
+    lastEvents.unshift({ receivedAt: new Date().toISOString(), eventType, payload });
+    if (lastEvents.length > MAX_EVENTS) lastEvents.pop();
+
+    if (pgPool) {
+      try {
+        await pgPool.query("INSERT INTO adversus_events (event_type, payload) VALUES ($1, $2)", [
+          eventType,
+          payload,
+        ]);
+      } catch (e) {
+        console.error("DB insert failed:", e);
+      }
     }
   }
+
   return res.status(200).json({ ok: true });
 });
 
@@ -229,7 +234,7 @@ app.get("/adversus/leads", requireSecret, async (req, res) => {
   }
 });
 
-// ==== Inspect NON-PII felter (masterData/resultData + deep + arrays/objekter) ====
+// ==== Inspect NON-PII (masterData/resultData) ====
 app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
   try {
     const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
@@ -244,40 +249,23 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
     }
     const payload = r.body;
 
-    // normalisér liste
+    // normaliser liste
     let rows = [];
     if (Array.isArray(payload)) rows = payload;
     else if (payload && typeof payload === "object") {
       for (const k of ["items", "data", "rows", "results", "list", "leads"]) {
-        if (Array.isArray(payload[k])) {
-          rows = payload[k];
-          break;
-        }
+        if (Array.isArray(payload[k])) { rows = payload[k]; break; }
       }
       if (!rows.length) {
-        const firstArrayKey = Object.keys(payload).find((k) => Array.isArray(payload[k]));
+        const firstArrayKey = Object.keys(payload).find(k => Array.isArray(payload[k]));
         if (firstArrayKey) rows = payload[firstArrayKey];
       }
     }
 
     const DIRECT_KEYS = [
-      "id",
-      "campaignId",
-      "created",
-      "updated",
-      "importedTime",
-      "lastUpdatedTime",
-      "lastModifiedTime",
-      "nextContactTime",
-      "contactAttempts",
-      "contactAttemptsInvalid",
-      "lastContactedBy",
-      "status",
-      "active",
-      "vip",
-      "common_redial",
-      "externalId",
-      "import_id",
+      "id","campaignId","created","updated","importedTime","lastUpdatedTime","lastModifiedTime",
+      "nextContactTime","contactAttempts","contactAttemptsInvalid","lastContactedBy",
+      "status","active","vip","common_redial","externalId","import_id"
     ];
 
     function fromDataArray(arr) {
@@ -286,7 +274,8 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
       for (const it of arr) {
         const label = String(it?.label ?? it?.name ?? it?.title ?? it?.key ?? "").trim();
         const value =
-          it?.value ?? it?.val ?? it?.data ?? it?.text ?? it?.content ?? (Array.isArray(it?.values) ? it.values.join(", ") : null);
+          it?.value ?? it?.val ?? it?.data ?? it?.text ?? it?.content ??
+          (Array.isArray(it?.values) ? it.values.join(", ") : null);
         if (!label) continue;
         if (value == null || String(value).trim() === "") continue;
         out.push({ label, value });
@@ -296,7 +285,7 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
     function fromDataObject(obj) {
       const out = [];
       if (!obj || typeof obj !== "object" || Array.isArray(obj)) return out;
-      for (const [k, v] of Object.entries(obj)) {
+      for (const [k,v] of Object.entries(obj)) {
         const label = String(k).trim();
         let value = v;
         if (value && typeof value === "object") {
@@ -309,29 +298,24 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
       return out;
     }
 
-    const seen = {}; // fieldId -> {count, example}
+    const seen = {};
     function hit(fieldId, val) {
-      if (val === undefined || val === null || (typeof val.trim === "function" && val.trim() === "")) return;
+      if (val == null || (typeof val === "string" && val.trim() === "")) return;
       if (!seen[fieldId]) seen[fieldId] = { count: 0, example: val };
       seen[fieldId].count++;
       if (seen[fieldId].example == null || seen[fieldId].example === "") seen[fieldId].example = val;
     }
 
-    rows.forEach((row) => {
-      // direkte felter
-      DIRECT_KEYS.forEach((k) => hit(k, row?.[k]));
-
-      // master/result arrays/objekter
-      fromDataArray(row?.masterData).forEach(({ label, value }) => hit(`masterData.${label}`, value));
-      fromDataArray(row?.resultData).forEach(({ label, value }) => hit(`resultData.${label}`, value));
-      fromDataObject(row?.masterData).forEach(({ label, value }) => hit(`masterData.${label}`, value));
-      fromDataObject(row?.resultData).forEach(({ label, value }) => hit(`resultData.${label}`, value));
-
-      // deep under data.*
-      fromDataArray(row?.data?.masterData).forEach(({ label, value }) => hit(`masterData.${label}`, value));
-      fromDataArray(row?.data?.resultData).forEach(({ label, value }) => hit(`resultData.${label}`, value));
-      fromDataObject(row?.data?.masterData).forEach(({ label, value }) => hit(`masterData.${label}`, value));
-      fromDataObject(row?.data?.resultData).forEach(({ label, value }) => hit(`resultData.${label}`, value));
+    rows.forEach(row => {
+      DIRECT_KEYS.forEach(k => hit(k, row?.[k]));
+      fromDataArray(row?.masterData).forEach(({label,value}) => hit(`masterData.${label}`, value));
+      fromDataArray(row?.resultData).forEach(({label,value}) => hit(`resultData.${label}`, value));
+      fromDataObject(row?.masterData).forEach(({label,value}) => hit(`masterData.${label}`, value));
+      fromDataObject(row?.resultData).forEach(({label,value}) => hit(`resultData.${label}`, value));
+      fromDataArray(row?.data?.masterData).forEach(({label,value}) => hit(`masterData.${label}`, value));
+      fromDataArray(row?.data?.resultData).forEach(({label,value}) => hit(`resultData.${label}`, value));
+      fromDataObject(row?.data?.masterData).forEach(({label,value}) => hit(`masterData.${label}`, value));
+      fromDataObject(row?.data?.resultData).forEach(({label,value}) => hit(`resultData.${label}`, value));
     });
 
     const total = rows.length || 1;
@@ -340,9 +324,9 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
         field,
         coverage_pct: Math.round((info.count / total) * 100),
         count: info.count,
-        example: info.example,
+        example: info.example
       }))
-      .sort((a, b) => b.coverage_pct - a.coverage_pct || a.field.localeCompare(b.field));
+      .sort((a,b) => (b.coverage_pct - a.coverage_pct) || a.field.localeCompare(b.field));
 
     res.json({ ok: true, total_rows: rows.length, fields: summary });
   } catch (e) {
@@ -350,50 +334,44 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
   }
 });
 
-// ==== Inspect RESULT FIELDS (scanner efter resultFields.*) ====
-app.get("/adversus/leads/inspect_resultfields", requireSecret, async (req, res) => {
+// ==== Inspect RESULT FIELDS – DEEP (hent seneste result pr. lead) ====
+app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, res) => {
   try {
-    // 1) hent leads-listen (samme query som du ellers ville bruge)
     const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
-    const r = await adversusGet(`/v1/leads${search}`);
-    if (!r.ok) {
-      return res.status(r.status || 500).json({
-        ok: false,
-        status: r.status,
-        url: r.url,
-        error: typeof r.body === "string" ? r.body.slice(0, 2000) : r.body,
+    const listResp = await adversusGet(`/v1/leads${search}`);
+    if (!listResp.ok) {
+      return res.status(listResp.status || 500).json({
+        ok: false, status: listResp.status, url: listResp.url,
+        error: typeof listResp.body === "string" ? listResp.body.slice(0,2000) : listResp.body
       });
     }
 
-    // normalisér liste
-    const payload = r.body;
-    let rows = [];
-    if (Array.isArray(payload)) rows = payload;
+    // normaliser liste
+    const payload = listResp.body;
+    let leads = [];
+    if (Array.isArray(payload)) leads = payload;
     else if (payload && typeof payload === "object") {
-      for (const k of ["items", "data", "rows", "results", "list", "leads"]) {
-        if (Array.isArray(payload[k])) {
-          rows = payload[k];
-          break;
-        }
+      for (const k of ["items","data","rows","results","list","leads"]) {
+        if (Array.isArray(payload[k])) { leads = payload[k]; break; }
       }
-      if (!rows.length) {
-        const firstArrayKey = Object.keys(payload).find((k) => Array.isArray(payload[k]));
-        if (firstArrayKey) rows = payload[firstArrayKey];
+      if (!leads.length) {
+        const firstArrayKey = Object.keys(payload).find(k => Array.isArray(payload[k]));
+        if (firstArrayKey) leads = payload[firstArrayKey];
       }
     }
 
-    // 2) vælg hvor mange leads vi scanner (default 20, max 40)
-    const sample = Math.max(1, Math.min(40, parseInt(String(req.query.sample || "20"), 10) || 20));
-    const toScan = rows.slice(0, sample);
+    const sample = Math.max(1, Math.min(20, parseInt(String(req.query.sample || "10"),10) || 10));
+    const toScan = leads.slice(0, sample);
 
-    // helpers til at aflæse arrays/objekter
+    // helpers
     function fromDataArray(arr) {
       const out = [];
       if (!Array.isArray(arr)) return out;
       for (const it of arr) {
         const label = String(it?.label ?? it?.name ?? it?.title ?? it?.key ?? "").trim();
         const value =
-          it?.value ?? it?.val ?? it?.data ?? it?.text ?? it?.content ?? (Array.isArray(it?.values) ? it.values.join(", ") : null);
+          it?.value ?? it?.val ?? it?.data ?? it?.text ?? it?.content ??
+          (Array.isArray(it?.values) ? it.values.join(", ") : null);
         if (!label) continue;
         if (value == null || String(value).trim() === "") continue;
         out.push({ label, value });
@@ -403,7 +381,7 @@ app.get("/adversus/leads/inspect_resultfields", requireSecret, async (req, res) 
     function fromDataObject(obj) {
       const out = [];
       if (!obj || typeof obj !== "object" || Array.isArray(obj)) return out;
-      for (const [k, v] of Object.entries(obj)) {
+      for (const [k,v] of Object.entries(obj)) {
         const label = String(k).trim();
         let value = v;
         if (value && typeof value === "object") {
@@ -415,44 +393,85 @@ app.get("/adversus/leads/inspect_resultfields", requireSecret, async (req, res) 
       }
       return out;
     }
+    const seen = {};
+    const tryLog = []; // diag: hvilke endpoints gav data
 
-    const seen = {}; // 'resultFields.<label>' -> {count, example}
     function hit(fieldId, val) {
-      if (val === undefined || val === null || (typeof val.trim === "function" && val.trim() === "")) return;
+      if (val == null || (typeof val === "string" && val.trim() === "")) return;
       if (!seen[fieldId]) seen[fieldId] = { count: 0, example: val };
       seen[fieldId].count++;
       if (seen[fieldId].example == null || seen[fieldId].example === "") seen[fieldId].example = val;
     }
 
-    // 3) Scan lokalt på lead-objektet efter resultFields i typiske placeringer – sekventielt, throttlet
-    const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+    const delay = (ms) => new Promise(r => setTimeout(r, ms));
+
+    // For hver lead: prøv et par sandsynlige endpoints for seneste resultat
     for (const lead of toScan) {
-      const candidates = [
-        lead?.resultFields,
-        lead?.data?.resultFields,
-        lead?.lastResult?.resultFields,
-        lead?.lastCall?.resultFields,
-        lead?.callResult?.resultFields,
-        lead?.result?.fields, // nogle modeller
-        lead?.lastResult?.fields,
-      ];
-      for (const p of candidates) {
-        fromDataArray(p).forEach(({ label, value }) => hit(`resultFields.${label}`, value));
-        fromDataObject(p).forEach(({ label, value }) => hit(`resultFields.${label}`, value));
+      const id = lead?.id ?? lead?.leadId ?? lead?.leadID;
+      if (!id) continue;
+
+      let resultCandidates = [];
+      // 1) typisk: /v1/leads/{id}/results
+      const p1 = await adversusGet(`/v1/leads/${id}/results`).catch(() => null);
+      if (p1?.ok && Array.isArray(p1.body)) {
+        tryLog.push({ id, endpoint: "leads/{id}/results", count: p1.body.length });
+        resultCandidates = p1.body;
       }
-      // throttle (hold os langt under 60/min og 2 concurrent)
-      await delay(600);
+
+      // 2) fallback: /v1/results?leadId={id}
+      if (!resultCandidates.length) {
+        const p2 = await adversusGet(`/v1/results?leadId=${encodeURIComponent(id)}`).catch(() => null);
+        if (p2?.ok && Array.isArray(p2.body)) {
+          tryLog.push({ id, endpoint: "results?leadId", count: p2.body.length });
+          resultCandidates = p2.body;
+        }
+      }
+
+      // 3) fallback: /v1/leads/{id}?expand=results (eller include)
+      if (!resultCandidates.length) {
+        const p3 = await adversusGet(`/v1/leads/${id}?expand=results`).catch(() => null);
+        const p3b = (!p3?.ok) ? await adversusGet(`/v1/leads/${id}?include=results`).catch(() => null) : null;
+        const src = p3?.ok ? p3 : p3b;
+        const srcName = p3?.ok ? "leads/{id}?expand=results" : (p3b?.ok ? "leads/{id}?include=results" : null);
+        if (src?.ok && src?.body && typeof src.body === "object") {
+          const arr = Array.isArray(src.body.results) ? src.body.results : Array.isArray(src.body?.data?.results) ? src.body.data.results : null;
+          if (arr) {
+            tryLog.push({ id, endpoint: srcName, count: arr.length });
+            resultCandidates = arr;
+          }
+        }
+      }
+
+      // vælg "seneste" – hvis der er created/updated, sorter; ellers brug første
+      if (Array.isArray(resultCandidates) && resultCandidates.length) {
+        resultCandidates.sort((a,b) => new Date(b?.created||b?.updated||0) - new Date(a?.created||a?.updated||0));
+        const latest = resultCandidates[0];
+
+        // felter kan hedde resultFields eller fields
+        const places = [
+          latest?.resultFields,
+          latest?.fields
+        ];
+        for (const p of places) {
+          fromDataArray(p).forEach(({label,value}) => hit(`resultFields.${label}`, value));
+          fromDataObject(p).forEach(({label,value}) => hit(`resultFields.${label}`, value));
+        }
+      }
+
+      // throttle (ca. 60/ min) – vi scanner kun få leads
+      await delay(900);
     }
 
     const fields = Object.entries(seen)
       .map(([field, info]) => ({ field, count: info.count, example: info.example }))
-      .sort((a, b) => b.count - a.count || a.field.localeCompare(b.field));
+      .sort((a,b) => b.count - a.count || a.field.localeCompare(b.field));
 
     res.json({
       ok: true,
-      total_returned: rows.length,
+      total_returned: leads.length,
       scanned: toScan.length,
       fields,
+      diag: tryLog
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
