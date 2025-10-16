@@ -329,8 +329,8 @@ app.get("/adversus/leads/inspect_nonpii", requireSecret, async (req, res) => {
   }
 });
 
-// ==== Scan NUMERISKE nøgler i alle resultater via expand/include=results (fx 96830) ====
-app.get("/adversus/leads/resultdata_ids_preview", requireSecret, async (req, res) => {
+// ==== Inspect RESULT (resultFields + resultData) — deep på lead-niveau OG seneste result ====
+app.get("/adversus/leads/inspect_resultfields_deep", requireSecret, async (req, res) => {
   try {
     const search = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
     const listResp = await adversusGet(`/v1/leads${search}`);
@@ -341,7 +341,6 @@ app.get("/adversus/leads/resultdata_ids_preview", requireSecret, async (req, res
       });
     }
 
-    // normaliser lead-liste
     const payload = listResp.body;
     let leads = [];
     if (Array.isArray(payload)) leads = payload;
@@ -355,138 +354,183 @@ app.get("/adversus/leads/resultdata_ids_preview", requireSecret, async (req, res
       }
     }
 
-    const sample = Math.max(1, Math.min(30, parseInt(String(req.query.sample || "15"),10) || 15));
+    const sample = Math.max(1, Math.min(20, parseInt(String(req.query.sample || "10"),10) || 10));
     const toScan = leads.slice(0, sample);
 
-    // success-filter (kan slås fra med requireSuccess=false)
-    const requireSuccess = String(req.query.requireSuccess ?? "true").toLowerCase() === "true";
-    const successWords = new Set(["success","successful","won","sale","solgt","succes","ok","completed"]);
-
-    function isSuccessResult(r) {
-      if (!requireSuccess) return true;
-      const cand = [
-        r?.status, r?.result, r?.outcome, r?.type, r?.disposition, r?.dispositionName,
-        r?.data?.status, r?.data?.result, r?.data?.outcome, r?.data?.type, r?.data?.disposition, r?.data?.dispositionName,
-        typeof r?.success === "boolean" ? (r.success ? "success" : "") : null
-      ].filter(Boolean).map(s => String(s).toLowerCase());
-      if (!cand.length) return false;
-      return cand.some(s => successWords.has(s));
-    }
-
-    // helpers til values/labels
-    function coerceExample(val) {
-      if (val == null) return null;
-      if (Array.isArray(val)) return val.filter(x => x != null).map(String).join(", ");
-      if (typeof val === "object") {
-        const v =
-          val.value ?? val.val ?? val.text ??
-          (Array.isArray(val.values) ? val.values.join(", ") : undefined);
-        return v != null ? String(v) : JSON.stringify(val).slice(0, 200);
-      }
-      return String(val);
-    }
-    function extractLabel(val, fallbackKey) {
-      if (val && typeof val === "object") {
-        const lbl = val.label ?? val.name ?? val.title ?? null;
-        if (lbl) return String(lbl);
-      }
-      return fallbackKey != null ? String(fallbackKey) : null;
-    }
-    function collectNumericEntries(obj, sourceTag) {
+    function fromDataArray(arr) {
       const out = [];
-      if (!obj || typeof obj !== "object") return out;
-      for (const [k, v] of Object.entries(obj)) {
-        if (!/^\d+$/.test(k)) continue;          // kun numeriske keys (fx "96830")
-        const numId = Number(k);
-        const example = coerceExample(v);
-        const label = extractLabel(v, k);
-        if (example != null && String(example).trim() !== "") {
-          out.push({ id: numId, label, example, source: sourceTag || "" });
+      if (!Array.isArray(arr)) return out;
+      for (const it of arr) {
+        const label = String(it?.label ?? it?.name ?? it?.title ?? it?.key ?? "").trim();
+        const id    = it?.id ?? it?.fieldId ?? (typeof it?.key === "number" ? it.key : null);
+        const value =
+          it?.value ?? it?.val ?? it?.data ?? it?.text ?? it?.content ??
+          (Array.isArray(it?.values) ? it.values.join(", ") : null);
+        if (!label && !id) continue;
+        if (value == null || String(value).trim() === "") continue;
+        out.push({ label: label || null, id: id || null, value });
+      }
+      return out;
+    }
+    function fromDataObject(obj) {
+      const out = [];
+      if (!obj || typeof obj !== "object" || Array.isArray(obj)) return out;
+
+      let structured = false;
+      for (const [k,v] of Object.entries(obj)) {
+        if (v && typeof v === "object" && !Array.isArray(v)) {
+          const label = String(v.label ?? v.name ?? v.title ?? k).trim();
+          const id    = v.id ?? v.fieldId ?? (/^\d+$/.test(k) ? Number(k) : null);
+          let value   = v.value ?? v.val ?? v.text ?? (Array.isArray(v.values) ? v.values.join(", ") : undefined);
+          if ((label || id) && value != null && String(value).trim() !== "") {
+            out.push({ label: label || null, id: id || null, value });
+            structured = true;
+          }
+        }
+      }
+      if (structured) return out;
+
+      for (const [k,v] of Object.entries(obj)) {
+        if (/^\d+$/.test(k)) {
+          const id = Number(k);
+          const value = v;
+          if (value != null && String(value).trim() !== "") {
+            out.push({ label: null, id, value });
+          }
         }
       }
       return out;
     }
-    function arr(x){ return Array.isArray(x) ? x : (x != null ? [x] : []); }
 
-    const seen = new Map(); // id -> { count, labelSamples:Set, example }
-    const perLead = [];
-    const diag = [];
+    const seen = {};
+    const tryLog = [];
+    function hit(prefix, label, id, val) {
+      if (val == null || (typeof val === "string" && val.trim() === "")) return;
+      const key = label ? `${prefix}.${label}` : (id ? `${prefix}.${id}` : null);
+      if (!key) return;
+      if (!seen[key]) seen[key] = { count: 0, example: val };
+      seen[key].count++;
+      if (seen[key].example == null || seen[key].example === "") seen[key].example = val;
+    }
     const delay = (ms) => new Promise(r => setTimeout(r, ms));
 
     for (const lead of toScan) {
-      const leadId = lead?.id ?? lead?.leadId ?? lead?.leadID;
-      if (!leadId) continue;
-      const hits = [];
-      const d = { leadId, tried: [] };
+      const id = lead?.id ?? lead?.leadId ?? lead?.leadID;
+      if (!id) continue;
 
-      // Kun expand/include=results (det vi VED virker hos dig)
-      let src = await adversusGet(`/v1/leads/${leadId}?expand=results`).catch(() => null);
-      if (!src?.ok) src = await adversusGet(`/v1/leads/${leadId}?include=results`).catch(() => null);
-
-      if (src?.ok && src.body) {
-        const b = src.body;
-
-        // find alle mulige arrays med results
-        const candidateArrays = []
-          .concat(arr(b?.results))
-          .concat(arr(b?.data?.results))
-          .concat(Array.isArray(b?.leads) ? arr(b.leads[0]?.results) : [])
-          .concat(Array.isArray(b?.items) ? arr(b.items[0]?.results) : []);
-
-        const resultsFlat = candidateArrays.flat().filter(Boolean);
-        d.tried.push({ endpoint: "leads/{id}?expand/include=results", count: resultsFlat.length });
-
-        for (const r of resultsFlat) {
-          if (!isSuccessResult(r)) continue;
-          hits.push(
-            ...collectNumericEntries(r?.resultData, "results.resultData"),
-            ...collectNumericEntries(r?.data?.resultData, "results.data.resultData"),
-            ...collectNumericEntries(r?.fields, "results.fields"),
-            ...collectNumericEntries(r?.resultFields, "results.resultFields"),
-            ...collectNumericEntries(r?.data?.fields, "results.data.fields")
-          );
-        }
-
-        // nogle konti lægger også data direkte på lead
-        const leadLevelRD = [
-          b?.resultData, b?.data?.resultData,
-          Array.isArray(b?.leads) ? b.leads[0]?.resultData : undefined,
-          Array.isArray(b?.leads) ? b.leads[0]?.data?.resultData : undefined
+      let expanded = await adversusGet(`/v1/leads/${id}?expand=resultFields`).catch(() => null);
+      if (!expanded?.ok) expanded = await adversusGet(`/v1/leads/${id}?include=resultFields`).catch(() => null);
+      if (expanded?.ok && expanded.body) {
+        const body = expanded.body;
+        const candidates = [
+          body?.resultFields,
+          body?.data?.resultFields,
+          Array.isArray(body?.leads) ? body.leads[0]?.resultFields : undefined,
+          Array.isArray(body?.leads) ? body.leads[0]?.data?.resultFields : undefined,
         ];
-        for (const c of leadLevelRD) hits.push(...collectNumericEntries(c, "lead.resultData"));
-
+        candidates.forEach(c => {
+          fromDataArray(c).forEach(({label,id,value}) => hit("resultFields", label, id, value));
+          fromDataObject(c).forEach(({label,id,value}) => hit("resultFields", label, id, value));
+        });
+        tryLog.push({ id, endpoint: "leads/{id}?expand/include=resultFields", got: true });
       } else {
-        d.tried.push({ endpoint: "leads/{id}?expand/include=results", error: true });
+        tryLog.push({ id, endpoint: "leads/{id}?expand/include=resultFields", got: false });
       }
 
-      perLead.push({ leadId, ids: hits });
-
-      // aggreger pr. id
-      for (const h of hits) {
-        if (!seen.has(h.id)) seen.set(h.id, { count: 0, labelSamples: new Set(), example: h.example });
-        const a = seen.get(h.id);
-        a.count++;
-        if (h.label) a.labelSamples.add(h.label);
-        if (!a.example) a.example = h.example;
+      const p = await adversusGet(`/v1/leads/${id}?expand=results`).catch(() => null);
+      if (p?.ok && p.body && typeof p.body === "object") {
+        let results = Array.isArray(p.body?.results) ? p.body.results : null;
+        if (!results && Array.isArray(p.body?.leads)) {
+          const first = p.body.leads[0];
+          if (first && Array.isArray(first.results)) results = first.results;
+          if (!results && (first?.resultData || first?.resultFields)) {
+            results = [{ resultData: first.resultData, resultFields: first.resultFields }];
+          }
+        }
+        if (Array.isArray(results) && results.length) {
+          results.sort((a,b) => new Date(b?.created||b?.updated||0) - new Date(a?.created||a?.updated||0));
+          const latest = results[0];
+          const places = [ latest?.resultFields, latest?.fields, latest?.resultData, latest?.data?.resultData ];
+          places.forEach(c => {
+            fromDataArray(c).forEach(({label,id,value}) => {
+              const pref = (c === latest?.resultData || c === latest?.data?.resultData) ? "resultData" : "resultFields";
+              hit(pref, label, id, value);
+            });
+            fromDataObject(c).forEach(({label,id,value}) => {
+              const pref = (c === latest?.resultData || c === latest?.data?.resultData) ? "resultData" : "resultFields";
+              hit(pref, label, id, value);
+            });
+          });
+          tryLog.push({ id, endpoint: "leads/{id}?expand=results", got: true });
+        } else {
+          tryLog.push({ id, endpoint: "leads/{id}?expand=results", got: false });
+        }
+      } else {
+        tryLog.push({ id, endpoint: "leads/{id}?expand=results", got: false });
       }
 
-      diag.push(d);
-      await delay(250); // roligt
+      await delay(700);
     }
 
-    const ids = Array.from(seen.entries()).map(([id, a]) => ({
-      id,
-      labels: Array.from(a.labelSamples).slice(0, 3),
-      count: a.count,
-      example: a.example
-    })).sort((x,y) => y.count - x.count || (x.id - y.id));
+    const fields = Object.entries(seen)
+      .map(([field, info]) => ({ field, count: info.count, example: info.example }))
+      .sort((a,b) => b.count - a.count || a.field.localeCompare(b.field));
 
-    res.json({ ok:true, scanned: toScan.length, ids, sample: perLead.slice(0,3), diag, requireSuccess });
+    res.json({ ok: true, total_returned: leads.length, scanned: toScan.length, fields, diag: tryLog });
   } catch (e) {
-    res.status(500).json({ ok:false, error: String(e.message || e) });
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
+// ==== NY: “peek” et enkelt lead – vis KUN nøgler/paths (PII-safe) ====
+app.get("/adversus/leads/result_peek_single", requireSecret, async (req, res) => {
+  try {
+    const leadId = String(req.query.leadId || "").trim();
+    if (!leadId) return res.status(400).json({ ok:false, error:"missing leadId" });
+
+    // henter to varianter for samme lead
+    const [expResults, expFields] = await Promise.allSettled([
+      adversusGet(`/v1/leads/${encodeURIComponent(leadId)}?expand=results`),
+      adversusGet(`/v1/leads/${encodeURIComponent(leadId)}?expand=resultFields`),
+    ]);
+
+    function toObj(p) { return (p && p.status==="fulfilled" && p.value?.ok && p.value?.body && typeof p.value.body==="object") ? p.value.body : null; }
+
+    const bodyResults = toObj(expResults);
+    const bodyFields  = toObj(expFields);
+
+    // lav PII-safe path-lister
+    function walk(obj, maxDepth = 7) {
+      const out = [];
+      function rec(node, path = [], depth = 0) {
+        if (!node || typeof node !== "object" || depth > maxDepth) return;
+        const entries = Array.isArray(node) ? node.map((v,i)=>[String(i), v]) : Object.entries(node);
+        for (const [k, v] of entries) {
+          const p = [...path, Array.isArray(node) ? `[${k}]` : k];
+          const t = (v===null) ? "null" : Array.isArray(v) ? "array" : typeof v;
+          out.push({ path: p.join("."), type: t });
+          if (t === "object" || t === "array") rec(v, p, depth+1);
+        }
+      }
+      rec(obj, [], 0);
+      return out;
+    }
+
+    const paths_expand = bodyResults ? walk(bodyResults) : [];
+    const paths_resultFields = bodyFields ? walk(bodyFields) : [];
+
+    res.json({
+      ok:true,
+      leadId,
+      expand_results_ok: !!bodyResults,
+      expand_resultFields_ok: !!bodyFields,
+      paths_expand: paths_expand.slice(0, 500),         // begræns for overskuelighed
+      paths_resultFields: paths_resultFields.slice(0, 500)
+    });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e.message || e) });
+  }
+});
 
 // ==== Start server ====
 app.listen(PORT, () => console.log(`Gavdash API listening on ${PORT}`));
