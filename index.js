@@ -131,11 +131,13 @@ if (DATABASE_URL) {
     connectionString: DATABASE_URL,
     max: 3,
     idleTimeoutMillis: 30000,
+    ssl: { rejectUnauthorized: false }, // <- VIGTIGT TILFØJET
   });
   pgPool.on("error", (err) => console.error("PG pool error:", err));
 } else {
   console.warn("DATABASE_URL is not set — DB disabled");
 }
+
 
 // ==== Init DB ====
 async function initDb() {
