@@ -197,6 +197,24 @@ app.get("/_debug/events/db", requireSecret, async (_req, res) => {
   }
 });
 
+app.get("/_debug/events/latest", requireSecret, async (_req, res) => {
+  if (!pgPool) {
+    return res.status(500).json({ ok: false, error: "No DB pool" });
+  }
+
+  try {
+    const r = await pgPool.query(
+      "SELECT id, received_at, event_type, payload FROM adversus_events ORDER BY id DESC LIMIT 1"
+    );
+    if (!r.rows.length) {
+      return res.json({ ok: true, event: null });
+    }
+    return res.json({ ok: true, event: r.rows[0] });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
 // ==== Webhook fra Adversus ====
 app.post("/webhook/adversus", requireSecret, async (req, res) => {
   const payload = req.body || {};
