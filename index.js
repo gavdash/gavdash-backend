@@ -75,29 +75,50 @@ function adversusAuthHeader() {
 async function adversusGet(pathWithQuery) {
   const url = `${ADVERSUS_BASE_URL}${pathWithQuery}`;
   const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), 20000);
+  const timeout = setTimeout(() => controller.abort(), 20000);
 
-  const r = await fetch(url, {
-    headers: {
-      Authorization: adversusAuthHeader(),
-      Accept: "application/json",
-    },
-    signal: controller.signal,
-  }).catch((err) => {
-    throw new Error(`Fetch failed: ${err?.name || ""} ${err?.message || err}`);
-  });
-
-  clearTimeout(t);
-
-  let body;
+  let response;
   try {
-    body = await r.json();
-  } catch {
-    body = await r.text();
+    response = await fetch(url, {
+      headers: {
+        Authorization: adversusAuthHeader(),
+        Accept: "application/json"
+      },
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timeout);
+    return {
+      ok: false,
+      status: 0,
+      url,
+      body: { error: `Network error: ${err.message}` }
+    };
   }
 
-  return { ok: r.ok, status: r.status, body, url };
+  clearTimeout(timeout);
+
+  // Læs body KUN én gang
+  let parsedBody;
+  try {
+    const text = await response.text();
+    try {
+      parsedBody = JSON.parse(text);
+    } catch {
+      parsedBody = text;
+    }
+  } catch (err) {
+    parsedBody = { error: "Failed to read body", detail: err.message };
+  }
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    url,
+    body: parsedBody
+  };
 }
+
 
 // ==== In-memory (debug) ====
 const lastEvents = [];
